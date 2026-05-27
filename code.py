@@ -98,57 +98,50 @@ TOOL_HANDLERS = {
 }
 
 # ═══════════════════════════════════════════════════════════
-# Three-Gate Permission Pipeline
+# Hook System
 # ═══════════════════════════════════════════════════════════
 
-# Gate 1: Hard deny list — always forbidden
+HOOKS = {"UserPromptSubmit":[],"PreToolUse":[],"PostToolUse":[],"Stop":[]}
+
+def register_hook(event:str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event:str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:  # teaching shortcut: block this tool call
+            return result
+    return None
+
+# permission check logic, now wrapped as a hook
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
-    return None
-
-
-# Gate 2: Rule matching — context-dependent checks
-PERMISSION_RULES = [
-    {"tools": ["write_file", "edit_file"],
-     "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-     "message": "Writing outside workspace"},
-    {"tools": ["bash"],
-     "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
-     "message": "Potentially destructive command"},
-]
-
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
-
-
-# Gate 3: User approval — wait for confirmation after rule match
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n\033[33m⚠  {reason}\033[0m")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
-
-
-# Pipeline: all three gates chained
-def check_permission(block) -> bool:
+def permission_hook(block):
+    """PreToolUse: s03 check_permission() logic moved here."""
     if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n\033[31m⛔ {reason}\033[0m")
-            return False
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
-    return True
+        for pattern in DENY_LIST:
+            if pattern in block.input.get("command", ""):
+                print(f"\n\033[31m⛔ Blocked: '{pattern}'\033[0m")
+                return "Permission denied by deny list"
+        for kw in DESTRUCTIVE:
+            if kw in block.input.get("command", ""):
+                print(f"\n\033[33m⚠  Potentially destructive command\033[0m")
+                print(f"   Tool: {block.name}({block.input})")
+                choice = input("   Allow? [y/N] ").strip().lower()
+                if choice not in ("y", "yes"):
+                    return "Permission denied by user"
+    if block.name in ("write_file", "edit_file"):
+        path = block.input.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            print(f"\n\033[33m⚠  Writing outside workspace\033[0m")
+            print(f"   Tool: {block.name}({block.input})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
+
+register_hook("PreToolUse",permission_hook)
 
 
 # ── The core pattern: a while loop that calls tools until the model stops ──
@@ -172,12 +165,11 @@ def agent_loop(messages:list):
             if block.type != "tool_use":
                 continue
 
-            print(f"\033[36m> {block.name}\033[0m")
-
-            # run through permission pipeline before executing
-            if not check_permission(block):
-                results.append({"type":"tool_result","tool_use_id":block.id,
-                               "content":"Permission denied."})
+            #hook replaces hard-coded check_permission()
+            blocked = trigger_hooks("PreToolUse",block)
+            if blocked:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": str(blocked)})
                 continue
 
             handler = TOOL_HANDLERS.get(block.name)
