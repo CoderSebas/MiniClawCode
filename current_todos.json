@@ -1,0 +1,10 @@
+[
+  {
+    "content": "Review Python files under s05_todo_write for style issues",
+    "status": "completed"
+  },
+  {
+    "content": "Fix E402: move path setup to conftest.py so test_utils.py has clean top-level imports",
+    "status": "completed"
+  }
+]

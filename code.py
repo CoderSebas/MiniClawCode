@@ -1,5 +1,4 @@
-import os
-import subprocess
+import os,subprocess,json
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -14,7 +13,12 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use base to solve tasks. Act, don't explain."
+# SYSTEM prompt adds planning guidance
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Before starting any multi-step task, use todo_write to plan your steps. "
+    "Update status as you go."
+)
 
 # ── Tool execution ────────────────────────────────────────
 def run_bash(command:str) -> str:
@@ -77,6 +81,22 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error:{e}"
 
+def run_todo_write(todos:list) -> str:
+    # validate required fields
+    for i,t in enumerate(todos):
+        if "content" not in t or "status" not in t:
+            return f"Errors: todos[{i}] missing 'content' or 'status'."
+        if t["status"] not in ("pending", "in_progress", "completed"):
+            return f"Errors: todos[{i}] has invalid status '{t['status']}'"
+        tasks_file = WORKDIR / "current_todos.json"
+        tasks_file.write_text(json.dumps(todos,indent=2,ensure_ascii=False)) # Output the todos to a json file
+        lines = ["\n\033[33m## Current Tasks\033[0m"]
+        for t in todos:
+            icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
+            lines.append(f"  [{icon}] {t['content']}")
+        print("\n".join(lines)) # Display current status in terminal
+        return f"Updated {len(todos)} tasks"
+
 
 # ── Tool definition: just bash ────────────────────────────
 TOOLS = [
@@ -90,11 +110,13 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
 ]
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
+    "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -141,12 +163,49 @@ def permission_hook(block):
                 return "Permission denied by user"
     return None
 
+def log_hook(block):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(block.input.values())[:2])[:60]
+    print(f"\033[90m[HOOK]] {block.name}({args_preview})\033[0m")
+    return None
+
+def large_output_hook(block,output):
+    if len(str(output)) > 100000:
+        print(f"033[33m[HOOK] ⚠ Large output from {block.name}:{len(str(output))} chars\033[0m")
+    return None
+
+# UserPromptSubmit hook: log user input before it reaches the LLM
+def context_inject_hook(query:str):
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None
+
+# Stop hook: print summary when loop is about to exit
+def summary_hook(messages:list):
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None
+
 register_hook("PreToolUse",permission_hook)
+register_hook("PreToolUse",log_hook)
+register_hook("PostToolUse",large_output_hook)
+register_hook("UserPromptSubmit",context_inject_hook)
+register_hook("Stop",summary_hook)
 
 
 # ── The core pattern: a while loop that calls tools until the model stops ──
+
+round_since_todo = 0
+
 def agent_loop(messages:list):
+    global round_since_todo
     while True:
+        # nag reminder — inject if model hasn't updated todos for 3 rounds
+        if round_since_todo >=3 and messages:
+            messages.append({"role":"user","content":"<reminder>Update your todos.</reminder>"})
+            round_since_todo = 0
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -157,6 +216,10 @@ def agent_loop(messages:list):
 
         # If the model didn't call a tool, we're done
         if response.stop_reason != "tool_use":
+            force = trigger_hooks("Stop",messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
             return
         
         # Execute each tool call, collect results
@@ -166,7 +229,7 @@ def agent_loop(messages:list):
                 continue
 
             #hook replaces hard-coded check_permission()
-            blocked = trigger_hooks("PreToolUse",block)
+            blocked = trigger_hooks("PreToolUse",block) # pre hook
             if blocked:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": str(blocked)})
@@ -174,7 +237,13 @@ def agent_loop(messages:list):
 
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown:{block.name}"
-            print(str(output)[:200])
+            
+            trigger_hooks("PostToolUse",block,output) # post hook
+
+            # reset nag counter when todo_write is called
+            if block.name == "todo_write":
+                round_since_todo = 0
+
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
 
         # Feed tool results back, loop continues
@@ -193,6 +262,7 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q","exit",""):
             break
+        trigger_hooks("UserPromptSubmit",query)
         history.append({"role":"user","content":query})
         agent_loop(history)
         # Print the model's final text response
