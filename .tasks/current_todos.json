@@ -1,0 +1,18 @@
+[
+  {
+    "content": "Explore the codebase structure",
+    "status": "completed"
+  },
+  {
+    "content": "Run quick security and issue scans",
+    "status": "completed"
+  },
+  {
+    "content": "Review code top-down from the main entry point",
+    "status": "completed"
+  },
+  {
+    "content": "Compile and report findings",
+    "status": "completed"
+  }
+]

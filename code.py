@@ -10,14 +10,77 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
+SKILLS_DIR = WORKDIR / "skills"
+TASKS_DIR = WORKDIR / ".tasks"; TASKS_DIR.mkdir(exist_ok=True)
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# SYSTEM prompt adds planning guidance
-SYSTEM = (
+# Skill catalog scan (used by build_system below)
+def _parse_frontmatter(text:str) -> tuple[dict,str]:
+    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
+    if not text.startswith("---"):
+        return {},text
+    parts = text.split("---",2)
+    if len(parts) < 3:
+        return {},text
+    meta = {}
+    for line in parts[1].strip().splitlines():
+        if ":" in line:
+            k,v = line.split(":",1)
+            meta[k.strip()] = v.strip().strip('"').strip("'")
+    return meta,parts[2].strip()
+
+# Build skill registry at startup (used for safe lookup in load_skill)
+SKILL_REGISTRY:dict[str,dict] = {}
+
+def _scan_skills():
+    """Scan skills/ dir, populate SKILL_REGISTRY with name/description/content."""
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        manifest = d / "SKILL.md"
+        if manifest.exists():
+            raw = manifest.read_text()
+            meta,body = _parse_frontmatter(raw)
+            name = meta.get("name",d.name)
+            desc = meta.get("description",raw.split("\n")[0].lstrip("#").strip())
+            SKILL_REGISTRY[name] = {"name":name,"description":desc,"content":raw}
+
+_scan_skills()
+
+def list_skills() -> str:
+    """List all skills (name + one-line description)."""
+    if not SKILL_REGISTRY:
+        return "(no skills found)"
+    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+
+# SYSTEM includes skill catalog (cheap — just names + descriptions)
+def build_system() -> str:
+    """Build SYSTEM prompt with skill catalog injected at startup."""
+    catalog = list_skills()
+    return (
+        f"You are a coding agent at {WORKDIR}."
+        "Before starting any multi-step task, use todo_write to plan your steps. "
+        "Update status as you go."
+        f"Skills available:\n{catalog}\n"
+        "Use load_skill to get full details when needed."
+    )
+
+# # SYSTEM prompt adds planning guidance
+# SYSTEM = (
+#     f"You are a coding agent at {WORKDIR}. "
+#     "Before starting any multi-step task, use todo_write to plan your steps. "
+#     "Update status as you go."
+# )
+SYSTEM = build_system()
+
+# subagent gets its own system prompt — no task, no recursion, no skill loading
+SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
-    "Before starting any multi-step task, use todo_write to plan your steps. "
-    "Update status as you go."
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
 )
 
 # ── Tool execution ────────────────────────────────────────
@@ -88,15 +151,94 @@ def run_todo_write(todos:list) -> str:
             return f"Errors: todos[{i}] missing 'content' or 'status'."
         if t["status"] not in ("pending", "in_progress", "completed"):
             return f"Errors: todos[{i}] has invalid status '{t['status']}'"
-        tasks_file = WORKDIR / "current_todos.json"
-        tasks_file.write_text(json.dumps(todos,indent=2,ensure_ascii=False)) # Output the todos to a json file
-        lines = ["\n\033[33m## Current Tasks\033[0m"]
-        for t in todos:
-            icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
-            lines.append(f"  [{icon}] {t['content']}")
-        print("\n".join(lines)) # Display current status in terminal
-        return f"Updated {len(todos)} tasks"
+    tasks_file = TASKS_DIR / "current_todos.json"
+    tasks_file.write_text(json.dumps(todos,indent=2,ensure_ascii=False)) # Output the todos to a json file
+    lines = ["\n\033[33m## Current Tasks\033[0m"]
+    for t in todos:
+        icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines)) # Display current status in terminal
+    return f"Updated {len(todos)} tasks"
+    
+def extract_text(content) -> str:
+    """Extract text from message content blocks."""
+    if not isinstance(content,list):
+        return str(content)
+    return "\n".join(getattr(b,"text","") for b in content if getattr(b,"type",None) == "text")
 
+# Subagent — fresh messages[], summary only
+
+SUB_TOOLS = [
+    {"name": "bash", "description": "Run a shell command.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Write content to a file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in a file once.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {"name": "glob", "description": "Find files matching a glob pattern.",
+     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+]
+# NO "task" tool — prevent recursive spawning
+
+SUB_HANDLERS = {
+    "bash": run_bash, "read_file": run_read, "write_file": run_write,
+    "edit_file": run_edit, "glob": run_glob,
+}
+
+def spawn_subagent(description:str) -> str:
+    """Spawn a subagent with fresh messages[], return summary only."""
+    print(f"\n\033[35m[Subagent spawned]\033[0m")
+    messages = [{"role": "user", "content": description}]  # fresh context
+
+    for _ in range(30): # safety limit
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+
+        messages.append({"role":"assistant","content":response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                # Issue 1: subagent also runs hooks (permissions apply)
+                blocked = trigger_hooks("PreToolUse",block)
+                if blocked:
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": str(blocked)})
+                    continue
+                handler = SUB_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                trigger_hooks("PostToolUse", block, output)
+                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": output})
+        messages.append({"role": "user", "content": results})
+
+    # Issue 5: fallback if safety limit hit during tool_use
+    result = extract_text(messages[-1]["content"])
+    if not result:
+        # last message is tool_result, look backwards for assistant text
+        for msg in reversed(messages):
+            if msg["role"] == "assitant":
+                result = extract_text(msg["content"])
+                if result:
+                    break
+        if not result:
+            result = "Subagent stopped after 30 turns without final answer."
+    print(f"\033[35m[Subagent done]\033[0m")
+    return result  # only summary, entire message history discarded
+
+# load_skill — runtime full content loading
+def load_skill(name:str) -> str:
+    """Load full skill content. Lookup via registry — no path traversal."""
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"skill not found:{name}"
+    return skill["content"]
 
 # ── Tool definition: just bash ────────────────────────────
 TOOLS = [
@@ -112,11 +254,17 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
     {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
+    {"name":"task","description":"Launch a subagent to handle a complex subtask. Returns only the final conclusion.",# Add task tool to parent's tools
+    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
+    # s07: skill tool (catalog is already in SYSTEM prompt, this loads full content)
+    {"name":"load_skill","description": "Load the full content of a skill by name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}
 ]
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
+    "task":spawn_subagent,"load_skill":load_skill,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -166,12 +314,12 @@ def permission_hook(block):
 def log_hook(block):
     """PreToolUse: log every tool call."""
     args_preview = str(list(block.input.values())[:2])[:60]
-    print(f"\033[90m[HOOK]] {block.name}({args_preview})\033[0m")
+    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
     return None
 
 def large_output_hook(block,output):
     if len(str(output)) > 100000:
-        print(f"033[33m[HOOK] ⚠ Large output from {block.name}:{len(str(output))} chars\033[0m")
+        print(f"\033[33m[HOOK] ⚠ Large output from {block.name}:{len(str(output))} chars\033[0m")
     return None
 
 # UserPromptSubmit hook: log user input before it reaches the LLM
@@ -194,7 +342,7 @@ register_hook("UserPromptSubmit",context_inject_hook)
 register_hook("Stop",summary_hook)
 
 
-# ── The core pattern: a while loop that calls tools until the model stops ──
+# agent_loop - nag reminder, task auto-dispatches
 
 round_since_todo = 0
 
@@ -223,6 +371,7 @@ def agent_loop(messages:list):
             return
         
         # Execute each tool call, collect results
+        round_since_todo += 1
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -253,7 +402,8 @@ def agent_loop(messages:list):
 # ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
     print("Welcome to MiniClawCode!")
-    print("Enter your question, press Enter to send and press q to quit.\n")
+    print("Skill Loading — catalog in SYSTEM, content on demand")
+    print("Type a question, press Enter. Type q to quit.\n")
     history = []
     while True:
         try:
