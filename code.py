@@ -1,5 +1,16 @@
-import os,subprocess,json
+import os,subprocess,json,time
 from pathlib import Path
+
+# for macOS
+try:
+    import readline
+    # macOS 的 libedit 在处理中文输入时有退格问题，这四行修复它
+    readline.parse_and_bind('set bind-tty-special-chars off')
+    readline.parse_and_bind('set input-meta on')
+    readline.parse_and_bind('set output-meta on')
+    readline.parse_and_bind('set convert-meta off')
+except ImportError:
+    pass
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -11,7 +22,9 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 
 WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TASKS_DIR = WORKDIR / ".tasks"; TASKS_DIR.mkdir(exist_ok=True)
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
@@ -76,7 +89,7 @@ def build_system() -> str:
 # )
 SYSTEM = build_system()
 
-# subagent gets its own system prompt — no task, no recursion, no skill loading
+# subagent gets its own system prompt — no task, no recursion, no compact, no skill loading
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Complete the task you were given, then return a concise summary. "
@@ -223,7 +236,7 @@ def spawn_subagent(description:str) -> str:
     if not result:
         # last message is tool_result, look backwards for assistant text
         for msg in reversed(messages):
-            if msg["role"] == "assitant":
+            if msg["role"] == "assistant":
                 result = extract_text(msg["content"])
                 if result:
                     break
@@ -239,6 +252,96 @@ def load_skill(name:str) -> str:
     if not skill:
         return f"skill not found:{name}"
     return skill["content"]
+
+# ═══════════════════════════════════════════════════════════
+# Four-Layer Compaction Pipeline
+# ═══════════════════════════════════════════════════════════
+
+CONTEXT_LIMIT = 50000
+KEEP_RECENT = 3
+PERSIST_THRESHOLD = 30000
+
+def estimate_size(msgs): return len(str(msgs))
+
+# L1: snipCompact — trim middle messages
+def snip_compact(messages, max_messages=50):
+    if len(messages) < max_messages: return messages
+    keep_head, keep_tail = 3, max_messages - 3
+    snipped = len(messages) - keep_head - keep_tail
+    return messages[:keep_head] + [{"role":"user","content":f"[snipped] {snipped} messages"}] + messages[-keep_tail:]
+
+# L2: microCompact — old result placeholders
+def collect_tool_results(messages):
+    blocks = []
+    for mi, msg in enumerate(messages):
+        if msg.get("role") != "user" or not isinstance(msg["content"],list): continue
+        for bi, block in enumerate(msg["content"]):
+            if isinstance(block,dict) and block.get("type") == "tool_result":
+                blocks.append((mi,bi,block))
+    return blocks
+
+def micro_compact(messages):
+    tool_results = collect_tool_results(messages)
+    if len(tool_results) <= KEEP_RECENT: return messages
+    for _, _, block in tool_results[:-KEEP_RECENT]:
+        if len(block.get("content","")) > 120:
+            block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
+    return messages
+
+# L3: toolResultBudget — persist large results to disk
+def persist_large_output(tool_use_id, output):
+    if len(output) <= PERSIST_THRESHOLD: return output
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+    if not path.exists(): path.write_text(output)
+    return f"<persisted-output>\nFull output:{path}\nPreview:\n{output[:2000]}\n<persisted-output>"
+
+def tool_result_budget(messages, max_bytes=200_000):
+    last = messages[-1] if messages else None
+    if not last or last.get("role") != "user" or not isinstance(last.get("content"), list): return messages
+    blocks = [(i, b) for i, b in enumerate(last["content"]) if isinstance(b, dict) and b.get("type") == "tool_result"]
+    total = sum(len(str(b.get("content", ""))) for _, b in blocks)
+    if total <= max_bytes: return messages
+    ranked = sorted(blocks, key=lambda p: len(str(p[1].get("content", ""))), reverse=True)
+    for _, block in ranked:
+        if total <= max_bytes: break
+        content = str(block.get("content", ""))
+        if len(content) <= PERSIST_THRESHOLD: continue
+        tid = block.get("tool_use_id", "unknown")
+        block["content"] = persist_large_output(tid, content)
+        total = sum(len(str(b.get("content", ""))) for _, b in blocks)
+    return messages
+
+# L4: autoCompact — LLM full summary
+def write_transcript(messages):
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with path.open("w") as f:
+        for msg in messages: f.write(json.dumps(msg,default=str) + "\n")
+    return path
+
+def summarize_history(messages):
+    conversation = json.dumps(messages, default=str)[:80000]
+    prompt = ("Summarize this coding-agent conversation so work can continue.\n"
+              "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
+              "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n" + conversation)
+    response = client.messages.create(model=MODEL, messages=[{"role":"user","content":prompt}],max_tokens=2000)
+    return "\n".join(
+        getattr(block, "text", "")
+        for block in response.content
+        if getattr(block, "type", None) == "text").strip() or "(empty summary)"
+
+def compact_history(messages):
+    transcript_path = write_transcript(messages)
+    print(f"[transcript saved: {transcript_path}]")
+    summary = summarize_history(messages)
+    return [{"role":"user","content":f"[Compacted]\n\n{summary}"}]
+
+# Emergency: reactiveCompact — on API error
+def reactive_compact(messages):
+    transcript = write_transcript(messages)
+    summary = summarize_history(messages)
+    return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *messages[-5:]]
 
 # ── Tool definition: just bash ────────────────────────────
 TOOLS = [
@@ -258,13 +361,16 @@ TOOLS = [
     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
     # s07: skill tool (catalog is already in SYSTEM prompt, this loads full content)
     {"name":"load_skill","description": "Load the full content of a skill by name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+     # s08 change: new compact tool — triggers compact_history, not a no-op
+    {"name": "compact", "description": "Summarize earlier conversation to free context space.",
+     "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
 ]
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
-    "task":spawn_subagent,"load_skill":load_skill,
+    "task":spawn_subagent,"load_skill":load_skill
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -341,23 +447,47 @@ register_hook("PostToolUse",large_output_hook)
 register_hook("UserPromptSubmit",context_inject_hook)
 register_hook("Stop",summary_hook)
 
-
-# agent_loop - nag reminder, task auto-dispatches
+# ═══════════════════════════════════════════════════════════
+#  agent_loop — core: nag reminder, task auto-dispatches, run compaction pipeline before LLM
+# ═══════════════════════════════════════════════════════════
 
 round_since_todo = 0
+MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 
 def agent_loop(messages:list):
     global round_since_todo
+    reactive_retries = 0
     while True:
+        # three preprocessors (0 API calls, cheap first)
+        # Order matches CC source: budget → snip → micro
+        messages[:] = tool_result_budget(messages)      # L3: persist large results first
+        messages[:] = snip_compact(messages)            # L1: trim middle
+        messages[:] = micro_compact(messages)           # L2: old result placeholders
+
+        # tokens still over threshold → LLM summary (1 API call)
+        if estimate_size(messages) > CONTEXT_LIMIT:
+            print("[Auto compact]")
+            messages[:] = compact_history(messages)
+
+
         # nag reminder — inject if model hasn't updated todos for 3 rounds
         if round_since_todo >=3 and messages:
             messages.append({"role":"user","content":"<reminder>Update your todos.</reminder>"})
             round_since_todo = 0
 
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
+        try:
+            response = client.messages.create(
+                model=MODEL, system=SYSTEM, messages=messages,
+                tools=TOOLS, max_tokens=8000,
+            )
+            reactive_retries = 0    # reset on successful API call
+        except Exception as e:
+            if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
+                print("[reactive compact]")
+                messages[:] = reactive_compact(messages)
+                reactive_retries += 1
+                continue
+            raise
         
         # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
@@ -377,7 +507,15 @@ def agent_loop(messages:list):
             if block.type != "tool_use":
                 continue
 
-            #hook replaces hard-coded check_permission()
+            # compact tool triggers compact_history, not a no-op string
+            if block.name == "compact":
+                messages[:] = compact_history(messages)
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": "[Compacted. Conversation history has been summarized.]"})
+                messages.append({"role": "user", "content": results})
+                break  # end current turn, start fresh with compacted context
+
+            # hook replaces hard-coded check_permission()
             blocked = trigger_hooks("PreToolUse",block) # pre hook
             if blocked:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -386,17 +524,22 @@ def agent_loop(messages:list):
 
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown:{block.name}"
-            
             trigger_hooks("PostToolUse",block,output) # post hook
+            print(str(output)[:200])
 
             # reset nag counter when todo_write is called
             if block.name == "todo_write":
                 round_since_todo = 0
 
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        else:
+            # normal path: no compact was called
+            # Feed tool results back, loop continues
+            messages.append({"role": "user", "content": results})
+            continue
+        # compact was called: results already appended above
+        continue
 
-        # Feed tool results back, loop continues
-        messages.append({"role": "user", "content": results})
 
 
 # ── Entry point ──────────────────────────────────────────

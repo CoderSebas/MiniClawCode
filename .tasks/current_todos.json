@@ -1,18 +1,34 @@
 [
   {
-    "content": "Explore the codebase structure",
+    "content": "Read hello.py",
     "status": "completed"
   },
   {
-    "content": "Run quick security and issue scans",
+    "content": "Read README.en.md",
     "status": "completed"
   },
   {
-    "content": "Review code top-down from the main entry point",
+    "content": "Read summary.md",
     "status": "completed"
   },
   {
-    "content": "Compile and report findings",
+    "content": "Read string_tools.py",
+    "status": "completed"
+  },
+  {
+    "content": "Read skills/agent-builder/SKILL.md",
+    "status": "completed"
+  },
+  {
+    "content": "Read skills/agent-builder/references/ files",
+    "status": "completed"
+  },
+  {
+    "content": "Read skills/mcp-builder/SKILL.md",
+    "status": "completed"
+  },
+  {
+    "content": "Do a full directory listing to understand project structure",
     "status": "completed"
   }
 ]
