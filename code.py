@@ -1,4 +1,4 @@
-import os,subprocess,json,time
+import os,subprocess,json,time,re
 from pathlib import Path
 
 # for macOS
@@ -21,6 +21,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
+MEMORY_DIR = WORKDIR / ".memory"; MEMORY_DIR.mkdir(parents=True,exist_ok=True)
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TASKS_DIR = WORKDIR / ".tasks"; TASKS_DIR.mkdir(exist_ok=True)
@@ -28,9 +30,12 @@ TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# Skill catalog scan (used by build_system below)
+# ═══════════════════════════════════════════════════════════
+# Memory System
+# ═══════════════════════════════════════════════════════════
+MEMORY_TYPES = ["user", "feedback", "project", "reference"]
+
 def _parse_frontmatter(text:str) -> tuple[dict,str]:
-    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
     if not text.startswith("---"):
         return {},text
     parts = text.split("---",2)
@@ -43,6 +48,263 @@ def _parse_frontmatter(text:str) -> tuple[dict,str]:
             meta[k.strip()] = v.strip().strip('"').strip("'")
     return meta,parts[2].strip()
 
+def write_memory_file(name:str, mem_type:str, description:str, body:str):
+    """Write a single memory file with YAML frontmatter."""
+    slug = name.lower().replace(" ","-").replace("/","-")
+    filename = f"{slug}.md"
+    filepath = MEMORY_DIR / filename
+    filepath.write_text(
+        f"---\nname:{name}\ndescription:{description}\ntype:{mem_type}\n---\n\n{body}\n"
+    )
+    _rebuild_index()
+    return filepath
+
+def _rebuild_index():
+    """Rebuild MEMORY.md index from all memory files."""
+    lines = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta,body = _parse_frontmatter(raw)
+        name = meta.get("name",f.stem)
+        desc = meta.get("description",body.split("\n")[0][:80])
+        lines.append(f"- [{name}]({f.name}) - {desc}")
+    MEMORY_INDEX.write_text("\n".join(lines) + "\n" if lines else "")
+
+def read_memory_index() -> str:
+    """Read MEMORY.md index (injected into SYSTEM every turn)."""
+    if not MEMORY_INDEX.exists():
+        return ""
+    text = MEMORY_INDEX.read_text().strip()
+    return text if text else ""
+
+def read_memory_file(filename:str) -> str|None:
+    """Read a single memory file's full content."""
+    path = MEMORY_DIR / filename
+    if not path.exists():
+        return None
+    return path.read_text()
+
+def list_memory_files() -> list[dict]:
+    """List all memory files with metadata."""
+    result = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta,body = _parse_frontmatter(raw)
+        result.append({
+            "filename": f.name,
+            "name": meta.get("name",f.stem),
+            "description": meta.get("description", ""),
+            "type": meta.get("type","user"),
+            "body": body
+        })
+    return result
+
+def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
+    """Select relevant memory filenames by matching recent conversation against
+    memory names/descriptions. Uses a simple LLM call (or falls back to keyword
+    matching on name+description)."""
+    files = list_memory_files()
+    if not files:
+        return []
+
+    # Collect recent user text for context
+    recent_texts = []
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content","")
+            if isinstance(content,list):
+                content = " ".join(
+                    str(getattr(b,"text","")) for b in content
+                    if getattr(b,"type",None) == "text"
+                )
+            if isinstance(content,str):
+                recent_texts.append(content)
+            if len(recent_texts) >= 3:
+                break
+    recent = " ".join(reversed(recent_texts))[:2000]
+
+    if not recent.strip():
+        return []
+
+    # Build catalog of name + description for LLM to choose from
+    catalog_lines = []
+    for i, f in enumerate(files):
+        catalog_lines.append(f"{i}:{f['name']} - {f['description']}")
+    catalog = "\n".join(catalog_lines)
+
+    prompt = (
+        "Given the recent conversation and the memory catalog below, "
+        "select the indices of memories that are clearly relevant. "
+        "Return ONLY a JSON array of integers, e.g. [0, 3]. "
+        "If none are relevant, return [].\n\n"
+        f"Recent conversation:\n{recent}\n\n"
+        f"Memory catalog:\n{catalog}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=200,
+        )
+        text = response.content[0].text.strip()
+        # Extract JSON array from response
+        match = re.search(r'\[.*?\]',text,re.DOTALL)
+        if match:
+            indices = json.loads(match.group())
+            selected = []
+            for idx in indices:
+                if isinstance(idx,int) and 0<= idx < len(files):
+                    selected.append(files[idx]['filename'])
+                    if len(selected) >= max_items:
+                        break
+            return selected
+    except Exception as e:
+        pass
+
+    # Fallback: keyword matching on name + description
+    keywords = [w.lower() for w in recent.split() if len(w) > 3]
+    selected = []
+    for f in files:
+        text = (f["name"] + " " + f["description"]).lower()
+        if any(kw in text for kw in keywords):
+            selected.append(f["filename"])
+            if len(selected) >= max_items:
+                break
+    return selected
+
+def load_memories(messages:list) -> str:
+    """Load relevant memory content for injection into context."""
+    selected_files = select_relevant_memories(messages)
+    if not selected_files:
+        return ""
+
+    parts = ["<relevant_memories>"]
+    for filename in selected_files:
+        content = read_memory_file(filename)
+        if content:
+            parts.append(content)
+    parts.append("</relevant_memories>")
+    return "\n\n".join(parts)
+
+def extract_memories(messages:list):
+    """Extract new memories from recent dialogue. Runs after each turn."""
+    # Collect recent conversation text
+    dialogue_parts = []
+    for msg in messages[-10:]:
+        role = msg.get("role","?")
+        content = msg.get("content","")
+        if isinstance(content,list):
+            content = " ".join(
+                str(getattr(b,"text","")) for b in content
+                if getattr(b,"type",None) == "text"
+            )
+        if isinstance(content,str) and content.strip():
+            dialogue_parts.append(f"{role}:{content}")
+    dialogue = "\n".join(dialogue_parts)
+
+    if not dialogue.strip():
+        return
+
+    # Check existing memories to avoid duplicates
+    existing = list_memory_files()
+    existing_desc = "\n".join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
+
+    prompt = (
+        "Extract user preferences, constraints, or project facts from this dialogue.\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n"
+        "- name: short kebab-case identifier (e.g. 'user-preference-tabs')\n"
+        "- type: one of 'user' (user preference), 'feedback' (guidance), "
+        "'project' (project fact), 'reference' (external pointer)\n"
+        "- description: one-line summary for index lookup\n"
+        "- body: full detail in markdown\n"
+        "If nothing new or already covered by existing memories, return [].\n\n"
+        f"Existing memories:\n{existing_desc}\n\n"
+        f"Dialogue:\n{dialogue[:4000]}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=MODEL,messages=[{"role":"user","content":prompt}],max_tokens=800
+        )
+        text = response.content[0].text.strip()
+        # Extract JSON array from response
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+        if not items:
+            return
+        count = 0
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                write_memory_file(name,mem_type,desc,body)
+                count += 1
+        if count:
+            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
+    except Exception as e:
+        pass
+
+CONSOLIDATE_THRESHOLD = 10
+
+def consolidate_memories():
+    """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
+    files = list_memory_files()
+    if len(files) < CONSOLIDATE_THRESHOLD:
+        return
+
+    catalog = "\n\n".join(
+        f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
+        for f in files
+    )
+
+    prompt = (
+        "Consolidate the following memory files. Rules:\n"
+        "1. Merge duplicates into one\n"
+        "2. Remove outdated/contradicted memories\n"
+        "3. Keep the total under 30 memories\n"
+        "4. Preserve important user preferences above all\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n\n"
+        f"{catalog[:16000]}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=MODEL, messages=[{"role":"user","content":prompt}],max_tokens=3000
+        )
+        text = response.content[0].text.strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+
+        # Remove old memory files (keep MEMORY.md)
+        for f in MEMORY_DIR.glob("*.md"):
+            if f.name != "MEMORY.md":
+                f.unlink()
+
+        for mem in items:
+            name = mem.get("name",f"memory_{int(time.time())}")
+            mem_type = mem.get("type","user")
+            desc = mem.get("description","")
+            body = mem.get("body","")
+            if desc and body:
+                write_memory_file(name,mem_type,desc,body)
+
+        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
+    except Exception as e:
+        pass
+
+
+# Skill catalog scan (used by build_system below)
 # Build skill registry at startup (used for safe lookup in load_skill)
 SKILL_REGISTRY:dict[str,dict] = {}
 
@@ -69,24 +331,23 @@ def list_skills() -> str:
         return "(no skills found)"
     return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
 
-# SYSTEM includes skill catalog (cheap — just names + descriptions)
+# SYSTEM includes skill catalog (cheap — just names + descriptions) and memory index
 def build_system() -> str:
     """Build SYSTEM prompt with skill catalog injected at startup."""
     catalog = list_skills()
+    index = read_memory_index()
+    memories_section = f"\n\nMemories available:\n{index}" if index else ""
     return (
         f"You are a coding agent at {WORKDIR}."
         "Before starting any multi-step task, use todo_write to plan your steps. "
         "Update status as you go."
         f"Skills available:\n{catalog}\n"
         "Use load_skill to get full details when needed."
+        f"{memories_section}\n"
+        "Relevant memories are injected below. Respect user preferences from memory.\n"
+        "When the user says 'remember' or expresses a clear preference, extract it as a memory."
     )
 
-# # SYSTEM prompt adds planning guidance
-# SYSTEM = (
-#     f"You are a coding agent at {WORKDIR}. "
-#     "Before starting any multi-step task, use todo_write to plan your steps. "
-#     "Update status as you go."
-# )
 SYSTEM = build_system()
 
 # subagent gets its own system prompt — no task, no recursion, no compact, no skill loading
@@ -110,7 +371,7 @@ def run_bash(command:str) -> str:
         return "Error: Timeout (120s)"
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
-    
+
 def safe_path(p:str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -125,7 +386,7 @@ def run_read(path:str, limit:int|None = None) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error:{e}"
-    
+
 def run_write(path:str, content:str) -> str:
     try:
         file_path = safe_path(path)
@@ -134,7 +395,7 @@ def run_write(path:str, content:str) -> str:
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error:{e}"
-    
+
 def run_edit(path:str, old_text:str, new_text:str) -> str:
     try:
         file_path = safe_path(path)
@@ -172,7 +433,7 @@ def run_todo_write(todos:list) -> str:
         lines.append(f"  [{icon}] {t['content']}")
     print("\n".join(lines)) # Display current status in terminal
     return f"Updated {len(todos)} tasks"
-    
+
 def extract_text(content) -> str:
     """Extract text from message content blocks."""
     if not isinstance(content,list):
@@ -448,7 +709,7 @@ register_hook("UserPromptSubmit",context_inject_hook)
 register_hook("Stop",summary_hook)
 
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — core: nag reminder, task auto-dispatches, run compaction pipeline before LLM
+#  agent_loop — core: nag reminder, task auto-dispatches, run compaction pipeline before LLM, inject memories + extract after each turn
 # ═══════════════════════════════════════════════════════════
 
 round_since_todo = 0
@@ -458,6 +719,16 @@ def agent_loop(messages:list):
     global round_since_todo
     reactive_retries = 0
     while True:
+        # rebuild system with current memory index + relevant memories
+        system = build_system()
+        memories_content = load_memories(messages)
+        if memories_content:
+            system += "\n\n" + memories_content
+
+        # save pre-compression snapshot for accurate memory extraction
+        pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
+            "content": str(m.get("content",""))} for m in messages]
+
         # three preprocessors (0 API calls, cheap first)
         # Order matches CC source: budget → snip → micro
         messages[:] = tool_result_budget(messages)      # L3: persist large results first
@@ -477,7 +748,7 @@ def agent_loop(messages:list):
 
         try:
             response = client.messages.create(
-                model=MODEL, system=SYSTEM, messages=messages,
+                model=MODEL, system=system, messages=messages,
                 tools=TOOLS, max_tokens=8000,
             )
             reactive_retries = 0    # reset on successful API call
@@ -488,18 +759,21 @@ def agent_loop(messages:list):
                 reactive_retries += 1
                 continue
             raise
-        
+
         # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
 
         # If the model didn't call a tool, we're done
         if response.stop_reason != "tool_use":
+            # extract from pre-compression snapshot for full fidelity
+            extract_memories(pre_compress)
+            consolidate_memories()
             force = trigger_hooks("Stop",messages)
             if force:
                 messages.append({"role": "user", "content": force})
                 continue
             return
-        
+
         # Execute each tool call, collect results
         round_since_todo += 1
         results = []

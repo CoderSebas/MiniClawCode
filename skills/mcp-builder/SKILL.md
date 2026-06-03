@@ -47,8 +47,8 @@ async def hello(name: str) -> str:
 
     Args:
         name: The name to greet
-    """
-    return f"Hello, {name}!"
+	"""
+	return f"Hello, {name}!"
 
 @server.tool()
 async def add_numbers(a: int, b: int) -> str:
@@ -57,17 +57,17 @@ async def add_numbers(a: int, b: int) -> str:
     Args:
         a: First number
         b: Second number
-    """
-    return str(a + b)
+	"""
+	return str(a + b)
 
 # Run server
 async def main():
-    async with stdio_server() as (read, write):
-        await server.run(read, write)
+	async with stdio_server() as (read, write):
+		await server.run(read, write)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+	import asyncio
+	asyncio.run(main())
 ```
 
 ### 3. Register with Claude
@@ -76,10 +76,10 @@ Add to `~/.claude/mcp.json`:
 ```json
 {
   "mcpServers": {
-    "my-server": {
-      "command": "python3",
-      "args": ["/path/to/my_server.py"]
-    }
+	"my-server": {
+	  "command": "python3",
+	  "args": ["/path/to/my_server.py"]
+	}
   }
 }
 ```
@@ -109,24 +109,24 @@ const server = new Server({
 // Define tools
 server.setRequestHandler("tools/list", async () => ({
   tools: [
-    {
-      name: "hello",
-      description: "Say hello to someone",
-      inputSchema: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "Name to greet" },
-        },
-        required: ["name"],
-      },
-    },
+	{
+	  name: "hello",
+	  description: "Say hello to someone",
+	  inputSchema: {
+		type: "object",
+		properties: {
+		  name: { type: "string", description: "Name to greet" },
+		},
+		required: ["name"],
+	  },
+	},
   ],
 }));
 
 server.setRequestHandler("tools/call", async (request) => {
   if (request.params.name === "hello") {
-    const name = request.params.arguments.name;
-    return { content: [{ type: "text", text: `Hello, ${name}!` }] };
+	const name = request.params.arguments.name;
+	return { content: [{ type: "text", text: `Hello, ${name}!` }] };
   }
   throw new Error("Unknown tool");
 });
@@ -148,14 +148,14 @@ server = Server("weather-server")
 
 @server.tool()
 async def get_weather(city: str) -> str:
-    """Get current weather for a city."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://api.weatherapi.com/v1/current.json",
-            params={"key": "YOUR_API_KEY", "q": city}
-        )
-        data = resp.json()
-        return f"{city}: {data['current']['temp_c']}C, {data['current']['condition']['text']}"
+	"""Get current weather for a city."""
+	async with httpx.AsyncClient() as client:
+		resp = await client.get(
+			f"https://api.weatherapi.com/v1/current.json",
+			params={"key": "YOUR_API_KEY", "q": city}
+		)
+		data = resp.json()
+		return f"{city}: {data['current']['temp_c']}C, {data['current']['condition']['text']}"
 ```
 
 ### Database Access
@@ -168,15 +168,15 @@ server = Server("db-server")
 
 @server.tool()
 async def query_db(sql: str) -> str:
-    """Execute a read-only SQL query."""
-    if not sql.strip().upper().startswith("SELECT"):
-        return "Error: Only SELECT queries allowed"
+	"""Execute a read-only SQL query."""
+	if not sql.strip().upper().startswith("SELECT"):
+		return "Error: Only SELECT queries allowed"
 
-    conn = sqlite3.connect("data.db")
-    cursor = conn.execute(sql)
-    rows = cursor.fetchall()
-    conn.close()
-    return str(rows)
+	conn = sqlite3.connect("data.db")
+	cursor = conn.execute(sql)
+	rows = cursor.fetchall()
+	conn.close()
+	return str(rows)
 ```
 
 ### Resources (Read-only Data)
@@ -184,13 +184,13 @@ async def query_db(sql: str) -> str:
 ```python
 @server.resource("config://settings")
 async def get_settings() -> str:
-    """Application settings."""
-    return open("settings.json").read()
+	"""Application settings."""
+	return open("settings.json").read()
 
 @server.resource("file://{path}")
 async def read_file(path: str) -> str:
-    """Read a file from the workspace."""
-    return open(path).read()
+	"""Read a file from the workspace."""
+	return open(path).read()
 ```
 
 ## Testing

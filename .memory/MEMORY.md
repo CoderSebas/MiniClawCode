@@ -1,0 +1,3 @@
+- [create-test-py](create-test-py.md) - User requested creation of test.py file
+- [indentation-style-tabs](indentation-style-tabs.md) - User prefers tabs for indentation, not spaces
+- [user-preference-single-quotes](user-preference-single-quotes.md) - User prefers single quotes over double quotes for strings

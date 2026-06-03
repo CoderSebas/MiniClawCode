@@ -1,34 +1,26 @@
 [
   {
-    "content": "Read hello.py",
+    "content": "Review project files for spaces-vs-tabs consistency",
     "status": "completed"
   },
   {
-    "content": "Read README.en.md",
+    "content": "Update VS Code settings to use tabs",
     "status": "completed"
   },
   {
-    "content": "Read summary.md",
-    "status": "completed"
+    "content": "Fix Python files using spaces to use tabs: code.py, hello.py, string_tools.py",
+    "status": "in_progress"
   },
   {
-    "content": "Read string_tools.py",
-    "status": "completed"
+    "content": "Fix agent-builder reference files using spaces to use tabs",
+    "status": "pending"
   },
   {
-    "content": "Read skills/agent-builder/SKILL.md",
-    "status": "completed"
+    "content": "Fix init_agent.py using spaces to use tabs",
+    "status": "pending"
   },
   {
-    "content": "Read skills/agent-builder/references/ files",
-    "status": "completed"
-  },
-  {
-    "content": "Read skills/mcp-builder/SKILL.md",
-    "status": "completed"
-  },
-  {
-    "content": "Do a full directory listing to understand project structure",
-    "status": "completed"
+    "content": "Fix markdown files (SKILL.md files) using spaces to use tabs",
+    "status": "pending"
   }
 ]

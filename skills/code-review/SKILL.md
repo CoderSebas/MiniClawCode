@@ -105,7 +105,7 @@ subprocess.run(["ls", user_input], check=True)
 def append(item, lst=[]):  # Bug: shared mutable default
 # Good:
 def append(item, lst=None):
-    lst = lst or []
+	lst = lst or []
 ```
 
 ### JavaScript/TypeScript
