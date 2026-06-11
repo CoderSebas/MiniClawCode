@@ -1,4 +1,4 @@
-import os,subprocess,json,time,re
+import os,subprocess,json,time,re,random
 from pathlib import Path
 
 # for macOS
@@ -28,7 +28,21 @@ TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TASKS_DIR = WORKDIR / ".tasks"; TASKS_DIR.mkdir(exist_ok=True)
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+PRIMARY_MODEL = os.environ["MODEL_ID"]
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
+
+# ── Constants ──
+
+ESCALATED_MAX_TOKENS = 64000
+DEFAULT_MAX_TOKENS = 8000
+MAX_RECOVERY_RETRIES = 3
+MAX_RETRIES = 10
+BASE_DELAY_MS = 500
+MAX_CONSECUTIVE_529 = 3
+CONTINUATION_PROMPT = (
+    "Output token limit hit. Resume directly — "
+    "no apology, no recap. Pick up mid-thought."
+)
 
 # ── Prompt Sections ──
 
@@ -111,6 +125,89 @@ def get_system_prompt(context: dict) -> str:
         loaded.append("memories")
     print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return _last_prompt
+
+# ── Error Recovery (s11 new) ──
+
+class RecoveryState:
+    """Track recovery attempts across the loop."""
+    def __init__(self):
+        self.has_escalated = False
+        self.recovery_count = 0
+        self.consecutive_529 = 0
+        self.has_attempted_reactive_compact = False
+        self.current_model = PRIMARY_MODEL
+
+def retry_delay(attempt, retry_after=None):
+    """Exponential backoff with jitter. Retry-After takes priority."""
+    if retry_after:
+        return retry_after
+    base = min(BASE_DELAY_MS * (2 ** attempt), 32000) / 1000
+    jitter = random.uniform(0, base*0.25)
+    return base + jitter
+
+def with_retry(fn, state: RecoveryState):
+    """Exponential backoff for transient errors (429/529).
+    Non-transient errors are re-raised for the outer handler."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = fn()
+            state.consecutive_529 = 0
+            return result
+        except Exception as e:
+            name = type(e).__name__
+            msg = str(e).lower()
+
+            # 429 rate limit -> exponential backoff
+            if "ratelimit" in name.lower() or "429" in msg:
+                delay = retry_delay(attempt)
+                print(f"  \033[33m[429 rate limit] retry {attempt+1}/{MAX_RETRIES},"
+                      f" wait {delay:.1f}s\033[0m")
+                time.sleep(delay)
+                continue
+
+            # 529 overloaded -> exponential backoff + fallback model
+            if "overloaded" in name.lower() or "529" in msg or "overloaded" in msg:
+                state.consecutive_529 += 1
+                if state.consecutive_529 >= MAX_CONSECUTIVE_529:
+                    if FALLBACK_MODEL:
+                        state.current_model = FALLBACK_MODEL
+                        state.consecutive_529 = 0
+                        print(f"  \033[31m[529 x{MAX_CONSECUTIVE_529}]"
+                              f" switching to {FALLBACK_MODEL}\033[0m")
+                    else:
+                        state.consecutive_529 = 0
+                        print(f"  \033[31m[529 x{MAX_CONSECUTIVE_529}]"
+                              f" no FALLBACK_MODEL_ID configured, continuing retry\033[0m")
+                delay = retry_delay(attempt)
+                print(f"  \033[33m[529 overloaded] retry {attempt+1}/{MAX_RETRIES},"
+                      f" wait {delay:.1f}s\033[0m")
+                time.sleep(delay)
+                continue
+
+            # Not transient -> re-raise for outer try/except
+            raise
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+def is_prompt_too_long_error(e: Exception) -> bool:
+    """Check whether an API error indicates prompt/context too long."""
+    msg = str(e).lower()
+    return (("prompt" in msg and "long" in msg)
+            or "prompt_is_too_long" in msg
+            or "context_length_exceeded" in msg
+            or "max_context_window" in msg)
+
+def reactive_compact(messages: list) -> list:
+    """Emergency compact — teaching version keeps last N messages.
+    Real CC generates a compact summary via LLM, then retries with
+    the compacted message list. Teaching version simplifies to tail
+    retention since s08/s09 already cover LLM-based compact."""
+    print("  \033[31m[reactive compact] trimming to last 5 messages\033[0m")
+    tail = messages[-5:]
+    return [{"role": "user",
+             "content": "[Reactive compact] Earlier conversation trimmed. "
+                        "Continue from where you left off."}, *tail]
+
+
 
 # ═══════════════════════════════════════════════════════════
 # Memory System
@@ -229,7 +326,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
 
     try:
         response = client.messages.create(
-            model=MODEL,
+            model=PRIMARY_MODEL,
             messages=[{"role":"user","content":prompt}],
             max_tokens=200,
         )
@@ -311,7 +408,7 @@ def extract_memories(messages:list):
 
     try:
         response = client.messages.create(
-            model=MODEL,messages=[{"role":"user","content":prompt}],max_tokens=800
+            model=PRIMARY_MODEL,messages=[{"role":"user","content":prompt}],max_tokens=800
         )
         text = response.content[0].text.strip()
         # Extract JSON array from response
@@ -360,7 +457,7 @@ def consolidate_memories():
 
     try:
         response = client.messages.create(
-            model=MODEL, messages=[{"role":"user","content":prompt}],max_tokens=3000
+            model=PRIMARY_MODEL, messages=[{"role":"user","content":prompt}],max_tokens=3000
         )
         text = response.content[0].text.strip()
         match = re.search(r'\[.*\]', text, re.DOTALL)
@@ -531,7 +628,7 @@ def spawn_subagent(description:str) -> str:
 
     for _ in range(30): # safety limit
         response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
+            model=PRIMARY_MODEL, system=SUB_SYSTEM,
             messages=messages, tools=SUB_TOOLS, max_tokens=8000,
         )
 
@@ -649,7 +746,7 @@ def summarize_history(messages):
     prompt = ("Summarize this coding-agent conversation so work can continue.\n"
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
               "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n" + conversation)
-    response = client.messages.create(model=MODEL, messages=[{"role":"user","content":prompt}],max_tokens=2000)
+    response = client.messages.create(model=PRIMARY_MODEL, messages=[{"role":"user","content":prompt}],max_tokens=2000)
     return "\n".join(
         getattr(block, "text", "")
         for block in response.content
@@ -660,12 +757,6 @@ def compact_history(messages):
     print(f"[transcript saved: {transcript_path}]")
     summary = summarize_history(messages)
     return [{"role":"user","content":f"[Compacted]\n\n{summary}"}]
-
-# Emergency: reactiveCompact — on API error
-def reactive_compact(messages):
-    transcript = write_transcript(messages)
-    summary = summarize_history(messages)
-    return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *messages[-5:]]
 
 # ── Tool definition: just bash ────────────────────────────
 TOOLS = [
@@ -781,6 +872,9 @@ MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 def agent_loop(messages:list, context:dict):
     global round_since_todo
     reactive_retries = 0
+    state = RecoveryState()
+    max_tokens = DEFAULT_MAX_TOKENS
+
     while True:
         # Re-evaluate context and prompt after each tool round
         context = update_context(context,messages)
@@ -807,21 +901,57 @@ def agent_loop(messages:list, context:dict):
             messages.append({"role":"user","content":"<reminder>Update your todos.</reminder>"})
             round_since_todo = 0
 
+        # ── LLM call: with_retry handles 429/529, outer handles rest ──
         try:
-            response = client.messages.create(
-                model=MODEL, system=system, messages=messages,
-                tools=TOOLS, max_tokens=8000,
-            )
+            response = with_retry(
+                lambda mt=max_tokens, mdl=state.current_model:
+                    client.messages.create(
+                    model=mdl, system=system, messages=messages,
+                    tools=TOOLS, max_tokens=mt),
+                    state)
             reactive_retries = 0    # reset on successful API call
         except Exception as e:
-            if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
-                print("[reactive compact]")
-                messages[:] = reactive_compact(messages)
-                reactive_retries += 1
-                continue
-            raise
+            # Path 2: prompt_too_long -> reactive compact (once)
+            if is_prompt_too_long_error(e):
+                if not state.has_attempted_reactive_compact:
+                    messages[:] = reactive_compact(messages)
+                    state.has_attempted_reactive_compact = True
+                    reactive_retries += 1
+                    continue
+                print("  \033[31m[unrecoverable] still too long after compact\033[0m")
+                messages.append({"role": "assistant", "content": [
+                    {"type": "text",
+                     "text": "[Error] Context too large, cannot continue."}]})
+                return
 
-        # Append assistant turn
+            # Unrecoverable
+            name = type(e).__name__
+            print(f"  \033[31m[unrecoverable] {name}: {str(e)[:100]}\033[0m")
+            messages.append({"role": "assistant", "content": [
+                {"type": "text", "text": f"[Error] {name}: {str(e)[:200]}"}]})
+            return
+
+        # ── Path 1: max_tokens -> escalate or continue ──
+        if response.stop_reason == "max_tokens":
+            # First escalation: don't append truncated output, retry same request
+            if not state.has_escalated:
+                max_tokens = ESCALATED_MAX_TOKENS
+                state.has_escalated = True
+                print(f"  \033[33m[max_tokens] escalating"
+                      f" {DEFAULT_MAX_TOKENS} -> {ESCALATED_MAX_TOKENS}\033[0m")
+                continue
+            # 64K still truncated: save truncated output + continuation prompt
+            messages.append({"role": "assistant", "content": response.content})
+            if state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                state.recovery_count += 1
+                print(f"  \033[33m[max_tokens] continuation"
+                      f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}\033[0m")
+                continue
+            print("  \033[31m[max_tokens] recovery limit reached\033[0m")
+            return
+
+        # Normal completion: append assistant response
         messages.append({"role": "assistant", "content": response.content})
 
         # If the model didn't call a tool, we're done
