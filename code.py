@@ -30,6 +30,88 @@ TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# ── Prompt Sections ──
+
+PROMPT_SECTIONS = {
+    "identity": "You are a coding agent. Act, don't explain.",
+    "tools": "Available tools: {tools}.",
+    "workspace": f"Working directory: {WORKDIR}",
+    "memory": "Relevant memories are injected below when available.",
+}
+
+def assemble_system_prompt(context: dict) -> str:
+    """Select and join prompt sections based on current context."""
+    sections = []
+
+    # Always loaded — identity, tools, workspace
+    sections.append(PROMPT_SECTIONS["identity"])
+    sections.append(PROMPT_SECTIONS["workspace"])
+    tools = context.get("enabled_tools") or ["bash", "read_file", "write_file"]
+    sections.append(
+        PROMPT_SECTIONS["tools"].format(tools=",".join(tools))
+    )
+
+    sections.append(
+        "Before starting any multi-step task, use todo_write to plan your steps. "
+        "Update status as you go."
+    )
+
+    skills_catalog = context.get("skills_catalog", "")
+    if skills_catalog:
+        sections.append(
+            "Skills available:\n"
+            f"{skills_catalog}\n\n"
+            "Use load_skill to get full details when needed."
+        )
+
+    # Conditional — memory loaded when MEMORY.md exists and has content
+    memories = context.get("memories","")
+    if memories:
+        sections.append(f"Relevant memories:\n{memories}")
+
+    return "\n\n".join(sections)
+
+# ── Context ──
+def update_context(context: dict, messages: list) -> dict:
+    """Derive context from real state: which tools exist, whether memory files exist."""
+    memories = ""
+    if MEMORY_INDEX.exists():
+        content = MEMORY_INDEX.read_text().strip()
+        if content:
+            memories = content
+    return {
+        "enabled_tools": list(TOOL_HANDLERS.keys()),
+        "workspace": str(WORKDIR),
+        "skills_catalog": list_skills(),
+        "memories": memories,
+    }
+
+_last_context_key = None
+_last_prompt = None
+
+def get_system_prompt(context: dict) -> str:
+    """Cache wrapper — reassemble only when context changes.
+
+    Uses json.dumps for deterministic serialization, not Python's hash()
+    which has process randomization and fails on nested dicts/lists.
+    This cache only avoids redundant string assembly within a process.
+    Real Claude Code additionally protects API-level prompt cache via
+    stable section ordering and SYSTEM_PROMPT_DYNAMIC_BOUNDARY.
+    """
+    global _last_context_key, _last_prompt
+    key = json.dumps(context, sort_keys=True, ensure_ascii=True, default=str)
+    if key == _last_context_key and _last_prompt:
+        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
+        return _last_prompt
+    _last_context_key = key
+    _last_prompt = assemble_system_prompt(context)
+
+    loaded = ["identity", "tools", "workspace"]
+    if context.get("memories"):
+        loaded.append("memories")
+    print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+    return _last_prompt
+
 # ═══════════════════════════════════════════════════════════
 # Memory System
 # ═══════════════════════════════════════════════════════════
@@ -331,25 +413,6 @@ def list_skills() -> str:
         return "(no skills found)"
     return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
 
-# SYSTEM includes skill catalog (cheap — just names + descriptions) and memory index
-def build_system() -> str:
-    """Build SYSTEM prompt with skill catalog injected at startup."""
-    catalog = list_skills()
-    index = read_memory_index()
-    memories_section = f"\n\nMemories available:\n{index}" if index else ""
-    return (
-        f"You are a coding agent at {WORKDIR}."
-        "Before starting any multi-step task, use todo_write to plan your steps. "
-        "Update status as you go."
-        f"Skills available:\n{catalog}\n"
-        "Use load_skill to get full details when needed."
-        f"{memories_section}\n"
-        "Relevant memories are injected below. Respect user preferences from memory.\n"
-        "When the user says 'remember' or expresses a clear preference, extract it as a memory."
-    )
-
-SYSTEM = build_system()
-
 # subagent gets its own system prompt — no task, no recursion, no compact, no skill loading
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
@@ -363,7 +426,7 @@ def run_bash(command:str) -> str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
-        r = subprocess.run(command,shell=True,cwd=os.getcwd(),
+        r = subprocess.run(command,shell=True,cwd=WORKDIR,
                            capture_output=True,text=True,timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
@@ -715,15 +778,13 @@ register_hook("Stop",summary_hook)
 round_since_todo = 0
 MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 
-def agent_loop(messages:list):
+def agent_loop(messages:list, context:dict):
     global round_since_todo
     reactive_retries = 0
     while True:
-        # rebuild system with current memory index + relevant memories
-        system = build_system()
-        memories_content = load_memories(messages)
-        if memories_content:
-            system += "\n\n" + memories_content
+        # Re-evaluate context and prompt after each tool round
+        context = update_context(context,messages)
+        system = get_system_prompt(context)
 
         # save pre-compression snapshot for accurate memory extraction
         pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
@@ -811,8 +872,6 @@ def agent_loop(messages:list):
             # Feed tool results back, loop continues
             messages.append({"role": "user", "content": results})
             continue
-        # compact was called: results already appended above
-        continue
 
 
 
@@ -822,6 +881,7 @@ if __name__ == "__main__":
     print("Skill Loading — catalog in SYSTEM, content on demand")
     print("Type a question, press Enter. Type q to quit.\n")
     history = []
+    context = update_context({}, [])
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
@@ -831,7 +891,7 @@ if __name__ == "__main__":
             break
         trigger_hooks("UserPromptSubmit",query)
         history.append({"role":"user","content":query})
-        agent_loop(history)
+        agent_loop(history,context)
         # Print the model's final text response
         response_content = history[-1]["content"]
         if isinstance(response_content,list):
