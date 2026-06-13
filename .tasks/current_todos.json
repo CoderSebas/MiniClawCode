@@ -1,26 +1,10 @@
 [
   {
-    "content": "Review project files for spaces-vs-tabs consistency",
+    "content": "Claim and complete 'Choose a project name' (task_1781339983_6390)",
     "status": "completed"
   },
   {
-    "content": "Update VS Code settings to use tabs",
-    "status": "completed"
-  },
-  {
-    "content": "Fix Python files using spaces to use tabs: code.py, hello.py, string_tools.py",
-    "status": "in_progress"
-  },
-  {
-    "content": "Fix agent-builder reference files using spaces to use tabs",
-    "status": "pending"
-  },
-  {
-    "content": "Fix init_agent.py using spaces to use tabs",
-    "status": "pending"
-  },
-  {
-    "content": "Fix markdown files (SKILL.md files) using spaces to use tabs",
+    "content": "Complete 'Write README title' (task_1781339988_2367) - now unblocked",
     "status": "pending"
   }
 ]

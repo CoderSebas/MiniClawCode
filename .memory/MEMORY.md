@@ -1,4 +1,12 @@
 - [create-test-py](create-test-py.md) - User requested creation of test.py file
-- [indentation-style-tabs](indentation-style-tabs.md) - User prefers tabs for indentation, not spaces
-- [read-file-readmemd](read-file-readmemd.md) - User requested to read the file README.md
-- [user-preference-single-quotes](user-preference-single-quotes.md) - User prefers single quotes over double quotes for strings
+- [delete-test-py](delete-test-py.md) - User requested to delete test.py in current directory
+- [first-unblocked-task-claim](first-unblocked-task-claim.md) - User prefers to claim and complete the first unblocked task
+- [indentation-style-tabs](indentation-style-tabs.md) - User prefers tabs for indentation
+- [project-name-miniclawcode](project-name-miniclawcode.md) - Project is named MiniClawCode
+- [read-file-readmemd](read-file-readmemd.md) - User requested to read README.md
+- [task-choose-project-name-completed](task-choose-project-name-completed.md) - Task to choose project name is completed
+- [task-choose-project-name](task-choose-project-name.md) - Task to choose project name exists as pending
+- [task-list-query-unblocked](task-list-query-unblocked.md) - User wants to list tasks to see unblocked ones
+- [task-write-readme-title-unblocked](task-write-readme-title-unblocked.md) - Write README title task is now unblocked
+- [task-write-readme-title](task-write-readme-title.md) - Task to write README title exists as pending
+- [user-preference-single-quotes](user-preference-single-quotes.md) - User prefers single quotes for Python strings

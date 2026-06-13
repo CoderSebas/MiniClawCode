@@ -1,5 +1,6 @@
 import os,subprocess,json,time,re,random
 from pathlib import Path
+from dataclasses import dataclass,asdict
 
 # for macOS
 try:
@@ -44,7 +45,91 @@ CONTINUATION_PROMPT = (
     "no apology, no recap. Pick up mid-thought."
 )
 
-# ── Prompt Sections ──
+# ── Task System ──
+
+TASKS_DIR = WORKDIR / ".tasks"
+TASKS_DIR.mkdir(exist_ok=True)
+
+@dataclass
+class Task:
+    id: str
+    subject: str
+    description: str
+    status: str             # pending | in_progress | completed
+    owner: str | None       # Agent name (multi-agent scenarios)
+    blockedBy: list[str]    # Dependency task IDs
+
+def _task_path(task_id: str) -> Path:
+    return TASKS_DIR / f"{task_id}.json"
+
+def create_task(subject: str, description:str = "",
+                blockedBy: list[str] | None = None):
+    task = Task(id=f"task_{int(time.time())}_{random.randint(0,9999):04d}",
+                subject=subject,
+                description=description,
+                status="pending",
+                owner=None,
+                blockedBy=blockedBy or [],
+                )
+    save_task(task)
+    return task
+
+def save_task(task: Task):
+    _task_path(task.id).write_text(json.dumps(asdict(task),indent=2))
+
+def load_task(task_id: str) -> Task:
+    return Task(**json.loads(_task_path(task_id).read_text()))
+
+def list_tasks() -> list[Task]:
+    return [Task(**json.loads(p.read_text()))
+            for p in sorted(TASKS_DIR.glob("task_*.json"))]
+
+def get_task(task_id: str) -> str:
+    """Return full task details as JSON."""
+    task = load_task(task_id)
+    return json.dumps(asdict(task), indent=2)
+
+def can_start(task_id: str) -> bool:
+    """Check if all blockedBy dependencies are completed.
+    Missing dependencies are treated as blocked."""
+    task = load_task(task_id)
+    for dep_id in task.blockedBy:
+        if not _task_path(dep_id).exists():
+            return False
+        if load_task(dep_id).status != "completed":
+            return False
+    return True
+
+def claim_task(task_id: str, owner: str = "agent") -> str:
+    task = load_task(task_id)
+    if task.status != "pending":
+        return f"Task {task_id} is {task.status}, cannot claim"
+    if not can_start(task_id):
+        deps = [d for d in task.blockedBy
+                if not _task_path(d).exists() or load_task(d).status != "completed"]
+        return f"Blocked by: {deps}"
+    task.owner = owner
+    task.status = "in_progress"
+    save_task(task)
+    print(f"  \033[36m[claim] {task.subject} → in_progress (owner: {owner})\033[0m")
+    return f"Claimed {task.id} ({task.subject})"
+
+def complete_task(task_id: str) -> str:
+    task = load_task(task_id)
+    if task.status != "in_progress":
+        return f"Task {task_id} is {task.status}, cannot complete"
+    task.status = "completed"
+    save_task(task)
+    unblocked = [t.subject for t in list_tasks()
+                 if t.status == "pending" and t.blockedBy and can_start(t.id)]
+    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+    msg = f"Completed {task.id} ({task.subject})"
+    if unblocked:
+        msg += f"\nUnblocked: {', '.join(unblocked)}"
+        print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
+    return msg
+
+# ── Prompt Assembly ──
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -60,14 +145,16 @@ def assemble_system_prompt(context: dict) -> str:
     # Always loaded — identity, tools, workspace
     sections.append(PROMPT_SECTIONS["identity"])
     sections.append(PROMPT_SECTIONS["workspace"])
-    tools = context.get("enabled_tools") or ["bash", "read_file", "write_file"]
+    tools = context.get("enabled_tools") or ["bash", "read_file", "write_file","create_task", "list_tasks", "get_task", "claim_task", "complete_task."]
     sections.append(
         PROMPT_SECTIONS["tools"].format(tools=",".join(tools))
     )
 
     sections.append(
-        "Before starting any multi-step task, use todo_write to plan your steps. "
-        "Update status as you go."
+        "Use todo_write for the current short-term execution plan within this conversation. "
+        "Use create_task/list_tasks/get_task/claim_task/complete_task for persistent tasks "
+        "that should survive across turns or have blockedBy dependencies. "
+        "Use spawn_subagent only for delegation, not for persistent task tracking."
     )
 
     skills_catalog = context.get("skills_catalog", "")
@@ -600,6 +687,42 @@ def extract_text(content) -> str:
         return str(content)
     return "\n".join(getattr(b,"text","") for b in content if getattr(b,"type",None) == "text")
 
+# Task tools
+
+def run_create_task(subject: str, description: str = "",
+                    blockedBy: list[str]|None = None) -> str:
+    task = create_task(subject, description, blockedBy)
+    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
+    return f"Created {task.id}: {task.subject}{deps}"
+
+def run_list_tasks() -> str:
+    tasks = list_tasks()
+    if not tasks:
+        return "No tasks. Use create_task to add some."
+    lines = []
+    for t in tasks:
+        icon = {"pending": "○", "in_progress": "●",
+                "completed": "✓"}.get(t.status, "?")
+        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        owner = f" [{t.owner}]" if t.owner else ""
+        lines.append(f"  {icon} {t.id}: {t.subject} "
+                     f"[{t.status}]{owner}{deps}")
+    return "\n".join(lines)
+
+def run_get_task(task_id: str) -> str:
+    try:
+        return get_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+def run_claim_task(task_id: str) -> str:
+    return claim_task(task_id, owner="agent")
+
+
+def run_complete_task(task_id: str) -> str:
+    return complete_task(task_id)
+
 # Subagent — fresh messages[], summary only
 
 SUB_TOOLS = [
@@ -772,20 +895,52 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
     {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
-    {"name":"task","description":"Launch a subagent to handle a complex subtask. Returns only the final conclusion.",# Add task tool to parent's tools
+    {"name":"spawn_subagent","description":"Launch a subagent to handle a complex subtask. Returns only the final conclusion.",# Add task tool to parent's tools
     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
     # s07: skill tool (catalog is already in SYSTEM prompt, this loads full content)
     {"name":"load_skill","description": "Load the full content of a skill by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-     # s08 change: new compact tool — triggers compact_history, not a no-op
+    # s08 change: new compact tool — triggers compact_history, not a no-op
     {"name": "compact", "description": "Summarize earlier conversation to free context space.",
      "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
+    # Task Systems
+    {"name": "create_task",
+     "description": "Create a new task with optional blockedBy dependencies.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "subject": {"type": "string"},
+                          "description": {"type": "string"},
+                          "blockedBy": {"type": "array",
+                                        "items": {"type": "string"}}},
+                      "required": ["subject"]}},
+    {"name": "list_tasks",
+     "description": "List all tasks with status, owner, and dependencies.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "get_task",
+     "description": "Get full details of a specific task by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "claim_task",
+     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "complete_task",
+     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
 ]
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
-    "task":spawn_subagent,"load_skill":load_skill
+    "spawn_subagent":spawn_subagent,"load_skill":load_skill,
+    "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "get_task": run_get_task, "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
 }
 
 # ═══════════════════════════════════════════════════════════
