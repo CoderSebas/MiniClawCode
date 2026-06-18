@@ -1,10 +1,14 @@
 [
   {
-    "content": "Claim and complete 'Choose a project name' (task_1781339983_6390)",
+    "content": "后台运行 pip list",
     "status": "completed"
   },
   {
-    "content": "Complete 'Write README title' (task_1781339988_2367) - now unblocked",
-    "status": "pending"
+    "content": "写 helloworld.py",
+    "status": "completed"
+  },
+  {
+    "content": "1分钟后将 pip list 结果写入 piplist_results.md",
+    "status": "in_progress"
   }
 ]

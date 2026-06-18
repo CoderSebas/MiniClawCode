@@ -1,6 +1,6 @@
 ---
 name:user-preference-single-quotes
-description:User prefers single quotes for Python strings
+description:Single quotes for Python strings
 type:preference
 ---
 

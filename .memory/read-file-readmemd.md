@@ -1,7 +1,7 @@
 ---
 name:read-file-readmemd
-description:User requested to read README.md
-type:file_action
+description:Read README.md was requested
+type:action
 ---
 
 User explicitly asked to read the file README.md.

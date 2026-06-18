@@ -1,7 +1,7 @@
 ---
 name:delete-test-py
-description:User requested to delete test.py in current directory
-type:file_action
+description:test.py was deleted
+type:action
 ---
 
-The user asked to delete the file `test.py` located in the current directory.
+The user asked to delete the file `test.py` located in the current directory. This was completed.

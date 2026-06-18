@@ -1,12 +1,15 @@
-- [create-test-py](create-test-py.md) - User requested creation of test.py file
-- [delete-test-py](delete-test-py.md) - User requested to delete test.py in current directory
-- [first-unblocked-task-claim](first-unblocked-task-claim.md) - User prefers to claim and complete the first unblocked task
-- [indentation-style-tabs](indentation-style-tabs.md) - User prefers tabs for indentation
-- [project-name-miniclawcode](project-name-miniclawcode.md) - Project is named MiniClawCode
-- [read-file-readmemd](read-file-readmemd.md) - User requested to read README.md
-- [task-choose-project-name-completed](task-choose-project-name-completed.md) - Task to choose project name is completed
-- [task-choose-project-name](task-choose-project-name.md) - Task to choose project name exists as pending
-- [task-list-query-unblocked](task-list-query-unblocked.md) - User wants to list tasks to see unblocked ones
-- [task-write-readme-title-unblocked](task-write-readme-title-unblocked.md) - Write README title task is now unblocked
-- [task-write-readme-title](task-write-readme-title.md) - Task to write README title exists as pending
-- [user-preference-single-quotes](user-preference-single-quotes.md) - User prefers single quotes for Python strings
+- [background-task-pip-list](background-task-pip-list.md) - User requested to run pip list in background
+- [create-test-py](create-test-py.md) - File creation of test.py was requested
+- [delete-test-py](delete-test-py.md) - test.py was deleted
+- [find-python-files-current-directory](find-python-files-current-directory.md) - Search for .py files in current dir
+- [first-unblocked-task-claim](first-unblocked-task-claim.md) - Workflow preference: claim first unblocked task
+- [indentation-style-tabs](indentation-style-tabs.md) - Tabs for indentation
+- [project-name-miniclawcode](project-name-miniclawcode.md) - Project name is MiniClawCode
+- [read-file-readmemd](read-file-readmemd.md) - Read README.md was requested
+- [schedule-pip-list-to-file](schedule-pip-list-to-file.md) - Schedule pip list results to file
+- [task-choose-project-name-completed](task-choose-project-name-completed.md) - Project name task completed
+- [task-list-query-unblocked](task-list-query-unblocked.md) - List tasks to see unblocked ones
+- [task-write-readme-title-unblocked](task-write-readme-title-unblocked.md) - Write README title task unblocked
+- [task-write-readme-title](task-write-readme-title.md) - Write README title task exists
+- [user-preference-single-quotes](user-preference-single-quotes.md) - Single quotes for Python strings
+- [write-helloworld-py](write-helloworld-py.md) - Create helloworld.py file

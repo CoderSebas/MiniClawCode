@@ -1,4 +1,4 @@
-import os,subprocess,json,time,re,random
+import os,subprocess,json,time,re,random,threading
 from pathlib import Path
 from dataclasses import dataclass,asdict
 
@@ -128,6 +128,84 @@ def complete_task(task_id: str) -> str:
         msg += f"\nUnblocked: {', '.join(unblocked)}"
         print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
     return msg
+
+# ── Background Tasks ──
+
+_bg_counter = 0
+background_tasks: dict[str,dict] = {}   # bg_id → {tool_use_id, command, status}
+background_results: dict[str, str] = {} # bg_id → output
+background_lock = threading.Lock()
+
+def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
+    """Fallback heuristic: commands likely to take > 30s."""
+    if tool_name != "bash":
+        return False
+    cmd = tool_input.get("command", "").lower()
+    slow_keywords = ["install", "build", "test", "deploy", "compile",
+                     "docker build", "pip install", "npm install",
+                     "cargo build", "pytest", "make"]
+    return any( kw in cmd for kw in slow_keywords)
+
+def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    """Model explicit request takes priority; fallback to heuristic."""
+    if tool_input.get("run_in_background"):
+        return True
+    return is_slow_operation(tool_name, tool_input)
+
+def execute_tool(block) -> str:
+    """Execute a tool call block, return output."""
+    handler = TOOL_HANDLERS.get(block.name)
+    if handler:
+        return handler(**block.input)
+    return f"Unknown tool: {block.name}"
+
+def start_background_task(block) -> str:
+    """Run tool in a daemon thread. Returns background task ID."""
+    global _bg_counter
+    _bg_counter += 1
+    bg_id = f"bg_{_bg_counter:04d}"
+    cmd = block.input.get("command", block.name)
+
+    def worker():
+        result = execute_tool(block)
+        trigger_hooks("PostToolUse", block, result)
+        with background_lock:
+            background_tasks[bg_id]["status"] = "completed"
+            background_results[bg_id] = result
+
+    with background_lock:
+        background_tasks[bg_id] = {
+            "tool_use_id": block.id,
+            "command": cmd,
+            "status": "running",
+        }
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
+    return bg_id
+
+def collect_background_results() -> list[str]:
+    """Collect completed background results as task_notification messages."""
+    with background_lock:
+        ready_ids = [bid for bid, task in background_tasks.items()
+                     if task["status"] == "completed"]
+    notifications = []
+    for bg_id in ready_ids:
+        with background_lock:
+            task = background_tasks.pop(bg_id)
+            output = background_results.pop(bg_id,"")
+        summary = output[:200] if len(output) > 200 else output
+        notifications.append(
+            f"<task_notification>\n"
+            f"  <task_id>{bg_id}</task_id>\n"
+            f"  <status>completed</status>\n"
+            f"  <command>{task['command']}</command>\n"
+            f"  <summary>{summary}</summary>\n"
+            f"</task_notification>")
+        print(f"  \033[32m[background done] {bg_id}: "
+              f"{task['command'][:40]} ({len(output)} chars)\033[0m")
+    return notifications
 
 # ── Prompt Assembly ──
 
@@ -605,7 +683,7 @@ SUB_SYSTEM = (
 )
 
 # ── Tool execution ────────────────────────────────────────
-def run_bash(command:str) -> str:
+def run_bash(command:str, run_in_background: bool = False) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -884,7 +962,7 @@ def compact_history(messages):
 # ── Tool definition: just bash ────────────────────────────
 TOOLS = [
     {"name":"bash","description":"Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "run_in_background": {"type": "boolean"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to a file.",
@@ -1123,17 +1201,18 @@ def agent_loop(messages:list, context:dict):
         # Execute each tool call, collect results
         round_since_todo += 1
         results = []
+        compact_requested = False
+
         for block in response.content:
             if block.type != "tool_use":
                 continue
 
             # compact tool triggers compact_history, not a no-op string
             if block.name == "compact":
-                messages[:] = compact_history(messages)
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": "[Compacted. Conversation history has been summarized.]"})
-                messages.append({"role": "user", "content": results})
-                break  # end current turn, start fresh with compacted context
+                compact_requested = True
+                continue
 
             # hook replaces hard-coded check_permission()
             blocked = trigger_hooks("PreToolUse",block) # pre hook
@@ -1142,21 +1221,43 @@ def agent_loop(messages:list, context:dict):
                                 "content": str(blocked)})
                 continue
 
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown:{block.name}"
-            trigger_hooks("PostToolUse",block,output) # post hook
-            print(str(output)[:200])
+            # background tasks check
+            if should_run_background(block.name, block.input):
+                bg_id = start_background_task(block)
+                results.append({"type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": f"[Background task {bg_id} started] "
+                                           f"Command: {block.input.get('command', '')}. "
+                                           f"Result will be available when complete."})
+            else:
+                output = execute_tool(block)
+                trigger_hooks("PostToolUse",block,output) # post hook
+                print(str(output)[:300])
 
-            # reset nag counter when todo_write is called
-            if block.name == "todo_write":
-                round_since_todo = 0
+                # reset nag counter when todo_write is called
+                if block.name == "todo_write":
+                    round_since_todo = 0
 
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-        else:
-            # normal path: no compact was called
-            # Feed tool results back, loop continues
-            messages.append({"role": "user", "content": results})
-            continue
+                results.append({"type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": output})
+
+        # Inject background notifications + tool results in one user message
+        user_content = []
+        user_content.extend(results)
+        bg_notifications = collect_background_results()
+        if bg_notifications:
+            for notif in bg_notifications:
+                user_content.append({"type": "text", "text": notif})
+            print(f"  \033[32m[inject] {len(bg_notifications)} background "
+              f"notification(s)\033[0m")
+
+        messages.append({"role": "user", "content": user_content})
+
+        if compact_requested:
+            messages[:] = compact_history(messages)
+
+        continue
 
 
 

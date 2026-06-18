@@ -1,7 +1,7 @@
 ---
 name:indentation-style-tabs
-description:User prefers tabs for indentation
+description:Tabs for indentation
 type:preference
 ---
 
-User prefers tabs for indentation, not spaces
+User prefers tabs for indentation, not spaces.

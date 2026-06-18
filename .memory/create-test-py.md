@@ -1,7 +1,7 @@
 ---
 name:create-test-py
-description:User requested creation of test.py file
-type:file_action
+description:File creation of test.py was requested
+type:task
 ---
 
-User requested creation of test.py file
+User requested creation of test.py file (subsequently deleted).

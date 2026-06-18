@@ -1,6 +1,6 @@
 ---
 name:first-unblocked-task-claim
-description:User prefers to claim and complete the first unblocked task
+description:Workflow preference: claim first unblocked task
 type:preference
 ---
 
