@@ -1,0 +1,8 @@
+{
+  "id": "task_1782136672_9471",
+  "subject": "Schedule a recurring task to print the current date every 2 minutes",
+  "description": "A cron job was set up with */2 * * * * to print the current date every 2 minutes.",
+  "status": "completed",
+  "owner": "agent",
+  "blockedBy": []
+}

@@ -1,14 +1,6 @@
 [
   {
-    "content": "后台运行 pip list",
+    "content": "Schedule cron job to print current date every 2 minutes",
     "status": "completed"
-  },
-  {
-    "content": "写 helloworld.py",
-    "status": "completed"
-  },
-  {
-    "content": "1分钟后将 pip list 结果写入 piplist_results.md",
-    "status": "in_progress"
   }
 ]
