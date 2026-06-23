@@ -1,6 +1,6 @@
 ---
 name:task-write-readme-title
-description:Write README title task - pending and now unblocked
+description:Write README title - unblocked
 type:task
 ---
 

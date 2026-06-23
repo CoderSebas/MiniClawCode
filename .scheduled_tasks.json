@@ -1,16 +1,1 @@
-[
-  {
-    "id": "cron_187365",
-    "cron": "*/2 * * * *",
-    "prompt": "Print the current date and time to a date_log.txt file in the working directory.",
-    "recurring": true,
-    "durable": true
-  },
-  {
-    "id": "cron_786444",
-    "cron": "*/2 * * * *",
-    "prompt": "Print the current date and time to date_log.txt in the working directory.",
-    "recurring": true,
-    "durable": true
-  }
-]
+[]

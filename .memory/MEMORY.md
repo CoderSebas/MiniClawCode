@@ -1,12 +1,13 @@
-- [bob-schema-exists](bob-schema-exists.md) - Bob confirmed schema.sql exists
+- [bob-schema-exists](bob-schema-exists.md) - Bob confirmed schema.sql exists with full contents
+- [cancel-cron-datetime-logging](cancel-cron-datetime-logging.md) - Cancel both cron jobs for datetime logging
+- [delete-date-log-txt](delete-date-log-txt.md) - Delete date_log.txt from current project directory
 - [first-unblocked-task-claim](first-unblocked-task-claim.md) - Workflow preference: claim first unblocked task
 - [indentation-style-tabs](indentation-style-tabs.md) - Tabs for indentation
 - [project-name-miniclawcode](project-name-miniclawcode.md) - Project is named MiniClawCode
 - [read-file-readmemd](read-file-readmemd.md) - Read README.md requested
 - [reminder-update-todos](reminder-update-todos.md) - Reminder to update task list/todos
-- [schedule-date-time-log](schedule-date-time-log.md) - Scheduled cron job writes current date/time to date_log.txt every 2 minutes
-- [spawn-bob-tester](spawn-bob-tester.md) - Spawn Bob as a tester to verify schema.sql
-- [task-create-schema-sql](task-create-schema-sql.md) - Create schema.sql file with users table
-- [task-write-readme-title](task-write-readme-title.md) - Write README title task - pending and now unblocked
+- [spawn-bob-tester](spawn-bob-tester.md) - Spawn Bob as tester to verify schema.sql
+- [task-create-schema-sql](task-create-schema-sql.md) - Create schema.sql with users table
+- [task-write-readme-title](task-write-readme-title.md) - Write README title - unblocked
 - [user-preference-single-quotes](user-preference-single-quotes.md) - Single quotes for Python strings
 - [write-helloworld-py](write-helloworld-py.md) - Create helloworld.py file

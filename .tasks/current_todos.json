@@ -1,10 +1,10 @@
 [
   {
-    "content": "Spawn bob as tester to verify schema.sql exists and list contents",
+    "content": "Cancel date_log cron jobs",
     "status": "completed"
   },
   {
-    "content": "Check inbox for bob's report",
+    "content": "Delete date_log.txt",
     "status": "completed"
   }
 ]

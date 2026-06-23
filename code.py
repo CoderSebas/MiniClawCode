@@ -1,7 +1,7 @@
 import os,subprocess,json,time,re,random,threading
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass,asdict
+from dataclasses import dataclass,asdict,field
 
 # for macOS
 try:
@@ -450,10 +450,10 @@ class MessageBus:
     Teaching version: no file locking; real CC uses proper-lockfile."""
 
     def send(self, from_agent: str, to_agent: str, content: str,
-             msg_type: str = "message"):
+             msg_type: str = "message", metadata=None):
         msg = {"from": from_agent, "to": to_agent,
                "content": content, "type": msg_type,
-               "ts": time.time()}
+               "ts": time.time(),"metadata":metadata or {}}
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
@@ -474,6 +474,70 @@ BUS = MessageBus()
 # Track spawned teammates
 active_teammates: dict[str, bool] = {}
 
+# ── Protocol State ──
+
+@dataclass
+class ProtocolState:
+    request_id: str
+    type: str       # "shutdown" | "plan_approval"
+    sender: str
+    target: str
+    status: str     # pending | approved | rejected
+    payload: str    # plan text or shutdown reason
+    created_at: float = field(default_factory=time.time)
+
+pending_requests: dict[str, ProtocolState] = {}
+
+def new_request_id() -> str:
+    return f"req_{random.randint(0, 999999):06d}"
+
+def match_response(response_type: str, request_id: str, approve: bool):
+    """Correlate a response to the original request via request_id.
+    Validates that response_type matches the request type."""
+    state = pending_requests.get(request_id)
+    if not state:
+        print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
+        return
+    # Validate response type matches request type
+    if state.type == "shutdown" and response_type != "shutdown_response":
+        print(f"  \033[31m[protocol] type mismatch: expected shutdown_response, "
+              f"got {response_type}\033[0m")
+        return
+    if state.type == "plan_approval" and response_type != "plan_approval_response":
+        print(f"  \033[31m[protocol] type mismatch: expected plan_approval_response, "
+              f"got {response_type}\033[0m")
+        return
+    if state.status != "pending":
+        print(f"  \033[33m[protocol] {request_id} already {state.status}, "
+              f"ignoring duplicate\033[0m")
+        return
+    state.status = "approved" if approve else "rejected"
+    icon = "✓" if approve else "✗"
+    color = "32" if approve else "31"
+    print(f"  \033[{color}m[protocol] {state.type} {icon} "
+          f"({request_id}: {state.status})\033[0m")
+
+# ── Unified Lead Inbox Consumer ──
+# Both check_inbox tool and main loop call this function.
+# Protocol responses are routed via match_response before returning.
+
+def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
+    """Read Lead's inbox. Route protocol responses, return all messages.
+    Called by both run_check_inbox() and main loop to avoid
+    messages being consumed without protocol routing."""
+    msgs = BUS.read_inbox("lead")
+    if not msgs:
+        return []
+    if route_protocol:
+        for msg in msgs:
+            meta = msg.get("metadata",{})
+            req_id = meta.get("request_id", "")
+            msg_type = msg.get("type","")
+            if req_id and msg_type.endswith("_response"):
+                approve = meta.get("approve",False)
+                match_response(msg_type, req_id, approve)
+    return msgs
+
 # ── Teammate Thread ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
@@ -486,7 +550,34 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
-              f"Send results via send_message to 'lead'.")
+              f"Send results via send_message to 'lead'."
+              f"Check inbox for protocol messages (shutdown_request, etc).")
+
+    def handle_inbox_message(name: str, msg: dict, messages: list) -> bool:
+        """Dispatch incoming protocol messages by type.
+        Returns True if teammate should stop."""
+        msg_type = msg.get("type", "message")
+        meta = msg.get("metadata", {})
+        req_id = meta.get("request_id", "")
+
+        if msg_type == "shutdown_request":
+            BUS.send(name, "lead", "Shutting down gracefully.",
+                     "shutdown_response",
+                     {"request_id": req_id, "approve": True})
+            print(f"  \033[35m[protocol] {name} approved shutdown "
+                  f"({req_id})\033[0m")
+            return True  # stop the loop
+
+        if msg_type == "plan_approval_response":
+            approve = meta.get("approve", False)
+            if approve:
+                messages.append({"role": "user",
+                    "content": f"[Plan approved] Proceed with the task."})
+            else:
+                messages.append({"role": "user",
+                    "content": f"[Plan rejected] Feedback: {msg['content']}"})
+
+        return False  # continue
 
     def run():
         messages = [{"role": "user", "content": prompt}]
@@ -510,27 +601,74 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                               "properties": {"to": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["to", "content"]}},
+            {"name": "submit_plan",
+             "description": "Submit a plan for Lead approval.",
+             "input_schema": {"type": "object",
+                              "properties": {"plan": {"type": "string"}},
+                              "required": ["plan"]}},
         ]
         sub_handlers = {
             "bash": run_bash, "read_file": run_read, "write_file": run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
                                                   "Sent")[1],
+            "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
         }
 
-        for _ in range(10):
+        shutdown_requested = False
+        while not shutdown_requested:
+            # Check inbox for protocol messages
             inbox = BUS.read_inbox(name)
-            if inbox:
+            should_stop = False
+            non_protocol = []
+            for msg in inbox:
+                if msg.get("type") in ("shutdown_request", "plan_approval_response"):
+                    should_stop = handle_inbox_message(name, msg, messages)
+                    if should_stop:
+                        break
+                else:
+                    non_protocol.append(msg)
+            if should_stop:
+                shutdown_requested = True
+                break
+            if non_protocol:
+                inbox_json = json.dumps(non_protocol)
                 messages.append({"role": "user",
-                                 "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
+                    "content": "<inbox>" + inbox_json + "</inbox>"})
+
+            # LLM turn
             try:
                 response = client.messages.create(
                     model=PRIMARY_MODEL, system=system, messages=messages[-20:],
                     tools=sub_tools, max_tokens=8000)
             except Exception:
                 break
+
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason != "tool_use":
-                break
+                # Idle: wait for inbox messages instead of exiting
+                # Real CC sends idle_notification to Lead here
+                while not shutdown_requested:
+                    time.sleep(1)
+                    inbox = BUS.read_inbox(name)
+                    if not inbox:
+                        continue
+                    for msg in inbox:
+                        if msg.get("type") in ("shutdown_request", "plan_approval_response"):
+                            should_stop = handle_inbox_message(name, msg, messages)
+                            if should_stop:
+                                shutdown_requested = True
+                                break
+                        else:
+                            non_protocol.append(msg)
+                    if shutdown_requested:
+                        break
+                    if non_protocol:
+                        inbox_json = json.dumps(non_protocol)
+                        messages.append({"role": "user",
+                            "content": "<inbox>" + inbox_json + "</inbox>"})
+                        break  # back to LLM turn with new messages
+
+            # Execute tool calls
             results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -561,7 +699,62 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
     return f"Teammate '{name}' spawned as {role}"
 
-# ── Team Tool Handlers ──
+def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    """Teammate submits a plan to Lead for approval.
+
+    Note: This is a protocol-level request, not a code-level gate.
+    After submitting, the teammate's thread continues running — it can
+    still call bash/write/etc. Real enforcement relies on the model
+    waiting for the approval response before acting. Code-level tool
+    gating would require blocking the teammate's tool dispatch until
+    approval arrives.
+    """
+    req_id = new_request_id()
+    pending_requests[req_id] = ProtocolState(
+        request_id=req_id, type="plan_approval",
+        sender=from_name, target="lead",
+        status="pending", payload=plan)
+    BUS.send(from_name, "lead", plan,
+             "plan_approval_request",
+             {"request_id": req_id})
+    return f"Plan submitted ({req_id}). Waiting for approval..."
+
+# ── Lead Protocol Tools ──
+
+def run_request_shutdown(teammate: str) -> str:
+    req_id = new_request_id()
+    pending_requests[req_id] = ProtocolState(
+        request_id=req_id, type="shutdown",
+        sender="lead", target=teammate,
+        status="pending", payload="")
+    BUS.send("lead", teammate, "Please shut down gracefully.",
+             "shutdown_request",
+             {"request_id": req_id})
+    print(f"  \033[35m[protocol] shutdown_request → {teammate} "
+          f"({req_id})\033[0m")
+    return f"Shutdown request sent to {teammate} (req: {req_id})"
+
+def run_request_plan(teammate: str, task: str) -> str:
+    """Lead asks a teammate to submit a plan for a task."""
+    BUS.send("lead", teammate, f"Please submit a plan for: {task}",
+             "message")
+    return f"Asked {teammate} to submit a plan"
+
+def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
+    state = pending_requests.get(request_id)
+    if not state:
+        return f"Request {request_id} not found"
+    if state.status != "pending":
+        return f"Request {request_id} already {state.status}"
+    state.status = "approved" if approve else "rejected"
+    BUS.send("lead", state.sender, feedback or ("Approved" if approve else "Rejected"),
+             "plan_approval_response",
+             {"request_id": request_id, "approve": approve})
+    icon = "✓" if approve else "✗"
+    print(f"  \033[32m[protocol] plan {icon} ({request_id})\033[0m")
+    return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
+
+# ── Other Lead Tool Handlers ──
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
@@ -571,12 +764,15 @@ def run_send_message(to: str, content: str) -> str:
     return f"Sent to {to}"
 
 def run_check_inbox() -> str:
-    msgs = BUS.read_inbox("lead")
+    msgs = consume_lead_inbox(route_protocol=True)
     if not msgs:
         return "(inbox empty)"
     lines = []
     for m in msgs:
-        lines.append(f"  [{m['from']}] {m['content'][:200]}")
+        meta = m.get("metadata", {})
+        req_id = meta.get("request_id", "")
+        tag = f" [{m['type']} req:{req_id}]" if req_id else f" [{m['type']}]"
+        lines.append(f"  [{m['from']}]{tag} {m['content'][:200]}")
     return "\n".join(lines)
 
 
@@ -1423,6 +1619,25 @@ TOOLS = [
      "description": "Check Lead's inbox for teammate messages.",
      "input_schema": {"type": "object", "properties": {},
                       "required": []}},
+    {"name": "request_shutdown",
+     "description": "Request a teammate to shut down gracefully.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"}},
+                      "required": ["teammate"]}},
+    {"name": "request_plan",
+     "description": "Ask a teammate to submit a plan for review.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"},
+                                     "task": {"type": "string"}},
+                      "required": ["teammate", "task"]}},
+    {"name": "review_plan",
+     "description": "Approve or reject a submitted plan by request_id.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "request_id": {"type": "string"},
+                          "approve": {"type": "boolean"},
+                          "feedback": {"type": "string"}},
+                      "required": ["request_id", "approve"]}},
 ]
 
 TOOL_HANDLERS = {
@@ -1437,6 +1652,9 @@ TOOL_HANDLERS = {
     "spawn_teammate": run_spawn_teammate,
     "send_message": run_send_message,
     "check_inbox": run_check_inbox,
+    "request_shutdown": run_request_shutdown,
+    "request_plan": run_request_plan,
+    "review_plan": run_review_plan,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -1714,10 +1932,13 @@ def run_agent_turn_locked(user_query: str | None = None):
     print_latest_assistant_text(session_history)
 
     # Check inbox for teammate results → inject into history
-    inbox = BUS.read_inbox("lead")
+    inbox = consume_lead_inbox(route_protocol=True)
     if inbox:
         inbox_text = "\n".join(
-                f"From {m['from']}: {m['content'][:200]}" for m in inbox)
+            f"From {m['from']} [{m.get('type', 'message')} "
+            f"req:{m.get('metadata', {}).get('request_id', '')}]: {m['content'][:200]}"
+            for m in inbox
+        )
 
         session_history.append({"role": "user",
                             "content": f"[Inbox]\n{inbox_text}"})
