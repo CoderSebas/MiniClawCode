@@ -1,7 +1,7 @@
 ---
 name:project-name-miniclawcode
-description:Project name is MiniClawCode
-type:project-info
+description:Project is named MiniClawCode
+type:memory
 ---
 
-The project is named MiniClawCode. Previously had placeholder name. Task to choose project name is completed.
+The project name is MiniClawCode.

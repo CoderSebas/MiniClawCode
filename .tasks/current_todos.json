@@ -1,6 +1,10 @@
 [
   {
-    "content": "Schedule cron job to print current date every 2 minutes",
+    "content": "Spawn bob as tester to verify schema.sql exists and list contents",
+    "status": "completed"
+  },
+  {
+    "content": "Check inbox for bob's report",
     "status": "completed"
   }
 ]

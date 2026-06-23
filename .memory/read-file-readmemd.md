@@ -1,6 +1,6 @@
 ---
 name:read-file-readmemd
-description:Read README.md was requested
+description:Read README.md requested
 type:action
 ---
 

@@ -1,15 +1,12 @@
-- [background-task-pip-list](background-task-pip-list.md) - User requested to run pip list in background
-- [create-test-py](create-test-py.md) - File creation of test.py was requested
-- [delete-test-py](delete-test-py.md) - test.py was deleted
-- [find-python-files-current-directory](find-python-files-current-directory.md) - Search for .py files in current dir
+- [bob-schema-exists](bob-schema-exists.md) - Bob confirmed schema.sql exists
 - [first-unblocked-task-claim](first-unblocked-task-claim.md) - Workflow preference: claim first unblocked task
 - [indentation-style-tabs](indentation-style-tabs.md) - Tabs for indentation
-- [project-name-miniclawcode](project-name-miniclawcode.md) - Project name is MiniClawCode
-- [read-file-readmemd](read-file-readmemd.md) - Read README.md was requested
-- [schedule-pip-list-to-file](schedule-pip-list-to-file.md) - Schedule pip list results to file
-- [task-choose-project-name-completed](task-choose-project-name-completed.md) - Project name task completed
-- [task-list-query-unblocked](task-list-query-unblocked.md) - List tasks to see unblocked ones
-- [task-write-readme-title-unblocked](task-write-readme-title-unblocked.md) - Write README title task unblocked
-- [task-write-readme-title](task-write-readme-title.md) - Write README title task exists
+- [project-name-miniclawcode](project-name-miniclawcode.md) - Project is named MiniClawCode
+- [read-file-readmemd](read-file-readmemd.md) - Read README.md requested
+- [reminder-update-todos](reminder-update-todos.md) - Reminder to update task list/todos
+- [schedule-date-time-log](schedule-date-time-log.md) - Scheduled cron job writes current date/time to date_log.txt every 2 minutes
+- [spawn-bob-tester](spawn-bob-tester.md) - Spawn Bob as a tester to verify schema.sql
+- [task-create-schema-sql](task-create-schema-sql.md) - Create schema.sql file with users table
+- [task-write-readme-title](task-write-readme-title.md) - Write README title task - pending and now unblocked
 - [user-preference-single-quotes](user-preference-single-quotes.md) - Single quotes for Python strings
 - [write-helloworld-py](write-helloworld-py.md) - Create helloworld.py file

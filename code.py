@@ -437,6 +437,148 @@ def run_list_crons() -> str:
 def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
 
+# ── MessageBus ──
+# This version uses simple file append + unlink.
+# Real CC uses proper-lockfile for concurrent write safety.
+
+MAILBOX_DIR = WORKDIR / ".mailboxes"
+MAILBOX_DIR.mkdir(exist_ok=True)
+
+class MessageBus:
+    """File-based message bus. Each agent has a .jsonl inbox.
+    Read is destructive: read_text + unlink (consumes messages).
+    Teaching version: no file locking; real CC uses proper-lockfile."""
+
+    def send(self, from_agent: str, to_agent: str, content: str,
+             msg_type: str = "message"):
+        msg = {"from": from_agent, "to": to_agent,
+               "content": content, "type": msg_type,
+               "ts": time.time()}
+        inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
+        with open(inbox, "a") as f:
+            f.write(json.dumps(msg) + "\n")
+        print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
+              f"{content[:50]}\033[0m")
+
+    def read_inbox(self, agent:str) -> list[dict]:
+        inbox = MAILBOX_DIR / f"{agent}.jsonl"
+        if not inbox.exists():
+            return []
+        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+                if line.strip()]
+        inbox.unlink()  # consume: read + delete
+        return msgs
+
+BUS = MessageBus()
+
+# Track spawned teammates
+active_teammates: dict[str, bool] = {}
+
+# ── Teammate Thread ──
+
+def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    """Spawn a teammate agent in a background thread.
+    Teaching version: max 10 rounds per teammate.
+    Real CC: teammates use idle loop (wait for inbox, work, repeat)
+    until shutdown_request."""
+    if name in active_teammates:
+        return f"Teammate '{name}' already exists"
+
+    system = (f"You are '{name}', a {role}. "
+              f"Use tools to complete tasks. "
+              f"Send results via send_message to 'lead'.")
+
+    def run():
+        messages = [{"role": "user", "content": prompt}]
+        sub_tools = [
+            {"name": "bash", "description": "Run a shell command.",
+             "input_schema": {"type": "object",
+                              "properties": {"command": {"type": "string"}},
+                              "required": ["command"]}},
+            {"name": "read_file", "description": "Read file contents.",
+             "input_schema": {"type": "object",
+                              "properties": {"path": {"type": "string"}},
+                              "required": ["path"]}},
+            {"name": "write_file", "description": "Write content to a file.",
+             "input_schema": {"type": "object",
+                              "properties": {"path": {"type": "string"},
+                                             "content": {"type": "string"}},
+                              "required": ["path", "content"]}},
+            {"name": "send_message",
+             "description": "Send a message to another agent.",
+             "input_schema": {"type": "object",
+                              "properties": {"to": {"type": "string"},
+                                             "content": {"type": "string"}},
+                              "required": ["to", "content"]}},
+        ]
+        sub_handlers = {
+            "bash": run_bash, "read_file": run_read, "write_file": run_write,
+            "send_message": lambda to, content: (BUS.send(name, to, content),
+                                                  "Sent")[1],
+        }
+
+        for _ in range(10):
+            inbox = BUS.read_inbox(name)
+            if inbox:
+                messages.append({"role": "user",
+                                 "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
+            try:
+                response = client.messages.create(
+                    model=PRIMARY_MODEL, system=system, messages=messages[-20:],
+                    tools=sub_tools, max_tokens=8000)
+            except Exception:
+                break
+            messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason != "tool_use":
+                break
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    handler = sub_handlers.get(block.name)
+                    output = handler(**block.input) if handler else "Unknown"
+                    results.append({"type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": str(output)})
+            messages.append({"role": "user", "content": results})
+
+        # Send final summary to Lead
+        summary = "Done."
+        for msg in reversed(messages):
+            if msg["role"] == "assistant" and isinstance(msg["content"], list):
+                for b in msg["content"]:
+                    if getattr(b, "type", None) == "text":
+                        summary = b.text
+                        break
+                else:
+                    continue
+                break
+        BUS.send(name,"lead",summary,"result")
+        active_teammates.pop(name,None)
+        print(f"  \033[32m[teammate] {name} finished\033[0m")
+
+    active_teammates[name] = True
+    threading.Thread(target=run, daemon=True).start()
+    print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
+    return f"Teammate '{name}' spawned as {role}"
+
+# ── Team Tool Handlers ──
+
+def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
+    return spawn_teammate_thread(name, role, prompt)
+
+def run_send_message(to: str, content: str) -> str:
+    BUS.send("lead", to, content)
+    return f"Sent to {to}"
+
+def run_check_inbox() -> str:
+    msgs = BUS.read_inbox("lead")
+    if not msgs:
+        return "(inbox empty)"
+    lines = []
+    for m in msgs:
+        lines.append(f"  [{m['from']}] {m['content'][:200]}")
+    return "\n".join(lines)
+
 
 # ── Prompt Assembly ──
 
@@ -522,7 +664,7 @@ def get_system_prompt(context: dict) -> str:
     print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return _last_prompt
 
-# ── Error Recovery (s11 new) ──
+# ── Error Recovery ──
 
 class RecoveryState:
     """Track recovery attempts across the loop."""
@@ -1190,7 +1332,7 @@ def compact_history(messages):
     summary = summarize_history(messages)
     return [{"role":"user","content":f"[Compacted]\n\n{summary}"}]
 
-# ── Tool definition: just bash ────────────────────────────
+# ── Tool Definitions ──
 TOOLS = [
     {"name":"bash","description":"Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "run_in_background": {"type": "boolean"}}, "required": ["command"]}},
@@ -1263,6 +1405,24 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"job_id": {"type": "string"}},
                       "required": ["job_id"]}},
+    {"name": "spawn_teammate",
+     "description": "Spawn a teammate agent in a background thread.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "name": {"type": "string"},
+                          "role": {"type": "string"},
+                          "prompt": {"type": "string"}},
+                      "required": ["name", "role", "prompt"]}},
+    {"name": "send_message",
+     "description": "Send a message to a teammate via MessageBus.",
+     "input_schema": {"type": "object",
+                      "properties": {"to": {"type": "string"},
+                                     "content": {"type": "string"}},
+                      "required": ["to", "content"]}},
+    {"name": "check_inbox",
+     "description": "Check Lead's inbox for teammate messages.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
 ]
 
 TOOL_HANDLERS = {
@@ -1274,6 +1434,9 @@ TOOL_HANDLERS = {
     "complete_task": run_complete_task,
     "schedule_cron": run_schedule_cron, "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
+    "spawn_teammate": run_spawn_teammate,
+    "send_message": run_send_message,
+    "check_inbox": run_check_inbox,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -1549,6 +1712,17 @@ def run_agent_turn_locked(user_query: str | None = None):
     session_context = agent_loop(session_history, session_context)
     session_context = update_context(session_context, session_history)
     print_latest_assistant_text(session_history)
+
+    # Check inbox for teammate results → inject into history
+    inbox = BUS.read_inbox("lead")
+    if inbox:
+        inbox_text = "\n".join(
+                f"From {m['from']}: {m['content'][:200]}" for m in inbox)
+
+        session_history.append({"role": "user",
+                            "content": f"[Inbox]\n{inbox_text}"})
+        print(f"\n\033[33m[Inbox: {len(inbox)} messages injected]\033[0m")
+
     print()
 
 def queue_processor_loop():
