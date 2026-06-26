@@ -2,7 +2,7 @@
   "id": "task_1781339988_3425",
   "subject": "Choose a project name",
   "description": "Decide on a name for the project. The current README.md already shows the project name as MiniClawCode.",
-  "status": "pending",
-  "owner": null,
+  "status": "in_progress",
+  "owner": "Alice",
   "blockedBy": []
 }

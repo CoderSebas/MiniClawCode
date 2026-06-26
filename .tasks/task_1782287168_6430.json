@@ -1,0 +1,8 @@
+{
+  "id": "task_1782287168_6430",
+  "subject": "Write API documentation",
+  "description": "Write API documentation for the MiniClawCode project covering auth, users, and health endpoints.",
+  "status": "completed",
+  "owner": "Bob",
+  "blockedBy": []
+}

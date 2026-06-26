@@ -2,8 +2,8 @@
   "id": "task_1781339988_2367",
   "subject": "Write README title",
   "description": "Write the README title for the project. Depends on the project name being chosen first.",
-  "status": "pending",
-  "owner": null,
+  "status": "completed",
+  "owner": "Bob",
   "blockedBy": [
     "task_1781339983_6390"
   ]

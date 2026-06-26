@@ -1,0 +1,8 @@
+{
+  "id": "task_1782287168_4720",
+  "subject": "Set up CI pipeline",
+  "description": "Create a GitHub Actions workflow for linting and testing on push and PR.",
+  "status": "completed",
+  "owner": "Bob",
+  "blockedBy": []
+}

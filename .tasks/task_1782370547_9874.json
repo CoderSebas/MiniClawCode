@@ -1,0 +1,9 @@
+{
+  "id": "task_1782370547_9874",
+  "subject": "Bob: Create a utils.py with two helper functions",
+  "description": "Create a file called bob_utils.py in the project root. The file should contain two functions: `add(a, b)` returning a+b, and `multiply(a, b)` returning a*b. Include a brief docstring for each function.",
+  "status": "completed",
+  "owner": "bob",
+  "blockedBy": [],
+  "worktree": "bob-work"
+}

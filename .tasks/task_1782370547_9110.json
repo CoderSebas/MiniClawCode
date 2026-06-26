@@ -1,0 +1,9 @@
+{
+  "id": "task_1782370547_9110",
+  "subject": "Alice: Add a greeting feature to the project",
+  "description": "Create a file called alice_greeting.py in the project root. The file should contain a function `greet(name)` that returns a friendly greeting message using f-strings. Also add a simple test call in the file under `if __name__ == '__main__':`.",
+  "status": "completed",
+  "owner": "alice",
+  "blockedBy": [],
+  "worktree": "alice-work"
+}

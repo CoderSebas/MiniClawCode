@@ -1,10 +1,18 @@
 [
   {
-    "content": "Cancel date_log cron jobs",
+    "content": "Create two new tasks",
     "status": "completed"
   },
   {
-    "content": "Delete date_log.txt",
+    "content": "Create worktrees for each task (bind with task_id)",
     "status": "completed"
+  },
+  {
+    "content": "Spawn alice and bob as teammates",
+    "status": "completed"
+  },
+  {
+    "content": "Monitor alice and bob auto-claiming and working",
+    "status": "in_progress"
   }
 ]
