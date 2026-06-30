@@ -4,4 +4,4 @@ description:Bob confirmed schema.sql exists with full contents
 type:fact
 ---
 
-Bob reported that the file `schema.sql` exists at `/Users/sebasmac/Desktop/Opensource/MiniClawCode/mini-claw-code/schema.sql`. Report includes full contents.
+Bob reported that the file `schema.sql` exists at `/Users/sebmac/Desktop/Opensource/MiniClawCode/mini-claw-code/schema.sql`. Report includes full contents.

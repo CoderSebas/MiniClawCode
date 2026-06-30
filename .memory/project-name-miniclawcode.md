@@ -1,7 +1,7 @@
 ---
 name:project-name-miniclawcode
 description:Project is named MiniClawCode
-type:project
+type:preference
 ---
 
 The project name is MiniClawCode.

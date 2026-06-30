@@ -1,7 +1,7 @@
 ---
 name:reminder-update-todos
-description:Reminder to update task list/todos
-type:instruction
+description:User reminder to update task list/todos
+type:preference
 ---
 
-The user included a `<reminder>` tag instructing to update the task list/todos. This should be respected and acted upon.
+User inserted a reminder: 'Update your todos.'

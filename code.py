@@ -290,7 +290,8 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
 
 def execute_tool(block) -> str:
     """Execute a tool call block, return output."""
-    handler = TOOL_HANDLERS.get(block.name)
+    tools, handlers = assemble_tool_pool()
+    handler = handlers.get(block.name)
     if handler:
         return handler(**block.input)
     return f"Unknown tool: {block.name}"
@@ -688,6 +689,7 @@ def idle_poll(agent_name: str, messages: list, name: str, role:str) -> str:
             messages.append({"role": "user",
                 "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
             print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
+
             return "work"
 
         # Scan task board
@@ -1012,6 +1014,116 @@ def run_check_inbox() -> str:
         lines.append(f"  [{m['from']}]{tag} {m['content'][:200]}")
     return "\n".join(lines)
 
+# ── MCP System ──
+class MCPClient:
+    """Discovers and calls tools on an MCP server (mock for teaching)."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.tools: list[dict] = []
+        self._handlers: dict[str, callable] = {}
+
+    def register(self, tool_defs: list[dict],
+                 handlers: dict[str, callable]):
+        self.tools = tool_defs
+        self._handlers = handlers
+
+    def call_tool(self, tool_name: str, args: dict) -> str:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return f"MCP error: unknown tool '{tool_name}'"
+        try:
+            return handler(**args)
+        except Exception as e:
+            return f"MCP error: {e}"
+
+
+mcp_clients: dict[str, MCPClient] = {}
+
+_DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
+
+def normalize_mcp_name(name: str) -> str:
+    """Replace non [a-zA-Z0-9_-] with underscore."""
+    return _DISALLOWED_CHARS.sub("_",name)
+
+def _mock_server_docs():
+    client = MCPClient("docs")
+    client.register(
+        tool_defs=[
+            {"name": "search", "description": "Search documentation. (readOnly)",
+             "inputSchema": {"type": "object",
+                             "properties": {"query": {"type": "string"}},
+                             "required": ["query"]}},
+            {"name": "get_version", "description": "Get API version. (readOnly)",
+             "inputSchema": {"type": "object", "properties": {},
+                             "required": []}},
+        ],
+        handlers={
+            "search": lambda query: f"[docs] Found 3 results for '{query}'",
+            "get_version": lambda: "[docs] API v2.1.0",
+        })
+    return client
+
+def _mock_server_deploy():
+    client = MCPClient("deploy")
+    client.register(
+        tool_defs=[
+            {"name": "trigger",
+             "description": "Trigger a deployment. (destructive — requires approval in real CC)",
+             "inputSchema": {"type": "object",
+                             "properties": {"service": {"type": "string"}},
+                             "required": ["service"]}},
+            {"name": "status", "description": "Check deployment status. (readOnly)",
+             "inputSchema": {"type": "object",
+                             "properties": {"service": {"type": "string"}},
+                             "required": ["service"]}},
+        ],
+        handlers={
+            "trigger": lambda service: f"[deploy] Triggered: {service}",
+            "status": lambda service: f"[deploy] {service}: running (v1.4.2)",
+        })
+    return client
+
+MOCK_SERVERS = {
+    "docs": _mock_server_docs,
+    "deploy": _mock_server_deploy,
+}
+
+def connect_mcp(name: str) -> str:
+    if name in mcp_clients:
+        return f"MCP server '{name}' already connected"
+    factory = MOCK_SERVERS.get(name)
+    if not factory:
+        available = ", ".join(MOCK_SERVERS.keys())
+        return f"Unknown server '{name}'. Available: {available}"
+    mcp_client = factory()
+    mcp_clients[name] = mcp_client
+    tool_names = [t["name"] for t in mcp_client.tools]
+    print(f"  \033[31m[mcp] connected: {name} → {tool_names}\033[0m")
+    return (f"Connected to MCP server '{name}'. "
+            f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
+
+def assemble_tool_pool() -> tuple[list[dict], dict]:
+    """Assemble builtin tools + all MCP tools into one pool."""
+    tools = list(BUILTIN_TOOLS)
+    handlers = dict(BUILTIN_HANDLERS)
+    for server_name, mcp_client in mcp_clients.items():
+        safe_server = normalize_mcp_name(server_name)
+        for tool_def in mcp_client.tools:
+            safe_tool = normalize_mcp_name(tool_def["name"])
+            prefixed = f"mcp__{safe_server}__{safe_tool}"
+            tools.append({
+                "name": prefixed,
+                "description": tool_def.get("description", ""),
+                "input_schema": tool_def.get("inputSchema", {}),
+            })
+            handlers[prefixed] = (
+                lambda *, c=mcp_client, t=tool_def["name"], **kw: c.call_tool(t, kw)
+            )
+    return tools, handlers
+
+def run_connect_mcp(name: str) -> str:
+    return connect_mcp(name)
 
 # ── Prompt Assembly ──
 
@@ -1054,6 +1166,14 @@ def assemble_system_prompt(context: dict) -> str:
     if memories:
         sections.append(f"Relevant memories:\n{memories}")
 
+    mcp_servers = context.get("mcp_servers", [])
+    if mcp_servers:
+        sections.append(
+            "Connected MCP servers: "
+            + ", ".join(mcp_servers)
+            + ". MCP tools are named mcp__{server}__{tool}."
+        )
+
     return "\n\n".join(sections)
 
 # ── Context ──
@@ -1064,11 +1184,15 @@ def update_context(context: dict, messages: list) -> dict:
         content = MEMORY_INDEX.read_text().strip()
         if content:
             memories = content
+
+    _, handlers = assemble_tool_pool()
+
     return {
-        "enabled_tools": list(TOOL_HANDLERS.keys()),
+        "enabled_tools": list(handlers.keys()),
         "workspace": str(WORKDIR),
         "skills_catalog": list_skills(),
         "memories": memories,
+        "mcp_servers": list(mcp_clients.keys()),
     }
 
 _last_context_key = None
@@ -1770,7 +1894,7 @@ def compact_history(messages):
     return [{"role":"user","content":f"[Compacted]\n\n{summary}"}]
 
 # ── Tool Definitions ──
-TOOLS = [
+BUILTIN_TOOLS = [
     {"name":"bash","description":"Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "run_in_background": {"type": "boolean"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -1896,9 +2020,14 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
+    {"name": "connect_mcp",
+     "description": "Connect to an MCP server (docs, deploy) and discover tools.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"}},
+                      "required": ["name"]}},
 ]
 
-TOOL_HANDLERS = {
+BUILTIN_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
     "spawn_subagent":spawn_subagent,"load_skill":load_skill,
@@ -1916,6 +2045,7 @@ TOOL_HANDLERS = {
     "create_worktree": run_create_worktree,
     "remove_worktree": run_remove_worktree,
     "keep_worktree": run_keep_worktree,
+    "connect_mcp": run_connect_mcp,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -1960,6 +2090,11 @@ def permission_hook(block):
             choice = input("   Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
                 return "Permission denied by user"
+    if block.name.startswith("mcp__deploy__trigger"):
+        print("\n⚠ MCP destructive tool")
+        choice = input("Allow? [y/N] ").strip().lower()
+        if choice not in ("y", "yes"):
+            return "Permission denied by user"
     return None
 
 def log_hook(block):
@@ -2016,6 +2151,7 @@ def agent_loop(messages:list, context:dict):
         # Re-evaluate context and prompt after each tool round
         context = update_context(context,messages)
         system = get_system_prompt(context)
+        tools, _ = assemble_tool_pool()
 
         # save pre-compression snapshot for accurate memory extraction
         pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
@@ -2058,7 +2194,7 @@ def agent_loop(messages:list, context:dict):
                 lambda mt=max_tokens, mdl=state.current_model:
                     client.messages.create(
                     model=mdl, system=system, messages=messages,
-                    tools=TOOLS, max_tokens=mt),
+                    tools=tools, max_tokens=mt),
                     state)
             reactive_retries = 0    # reset on successful API call
         except Exception as e:
