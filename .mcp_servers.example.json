@@ -1,0 +1,41 @@
+{
+  "servers": [
+    {
+      "name": "localdocs",
+      "mode": "read_only",
+      "description": "Example shell-backed MCP server",
+      "tools": [
+        {
+          "name": "list_python_files",
+          "description": "List Python files in the current workspace.",
+          "command": "rg --files -g \"*.py\"",
+          "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "risk": "safe",
+          "timeout": 15
+        },
+        {
+          "name": "search_text",
+          "description": "Search for text using ripgrep.",
+          "command": "rg -n \"{query}\" .",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          },
+          "risk": "safe",
+          "timeout": 15
+        }
+      ]
+    }
+  ]
+}
